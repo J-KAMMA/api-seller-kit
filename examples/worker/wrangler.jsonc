@@ -1,0 +1,16 @@
+{
+  // Example seller API on Cloudflare Workers (Avalanche Fuji testnet only).
+  // Secret: SUBSCRIPTION_SECRET (wrangler secret put SUBSCRIPTION_SECRET) if you sell a monthly plan.
+  "name": "my-api-x402",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-07-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "SELLER": "0xYOUR_ADDRESS",
+    "PAY_TO": "0xYOUR_SPLITTER_FROM_HUB_LISTING",
+    "PRICE_ATOMIC": "10000",
+    "MONTHLY_PRICE_ATOMIC": "50000",
+    "MONTHLY_QUOTA": "5",
+    "FACILITATOR_URL": "https://jkamma-facilitator-staging.jkamma-hub.workers.dev"
+  }
+}
