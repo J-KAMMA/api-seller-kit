@@ -1,6 +1,6 @@
 {
   "name": "@jkamma/api-seller-kit",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Sell any HTTP API per call, prepaid or monthly with x402 on the Hub API market (Avalanche Fuji testnet)",
   "license": "MIT",

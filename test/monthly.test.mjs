@@ -115,6 +115,26 @@ test("upstream failure on a token call gives the use back", async () => {
   assert.equal((await gate(withToken(token), ok)).status, 402);
 });
 
+test("only the issued spelling of a token is accepted, and the quota counts once", async () => {
+  const { gate } = setup({ quota: 3 });
+  const token = (await purchase(gate)).headers.get("hub-subscription"); // use 1
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const last = alphabet.indexOf(token.at(-1));
+  let served = 0;
+  for (let bits = 0; bits < 4; bits++) {
+    const spelled = token.slice(0, -1) + alphabet[(last & ~3) + bits];
+    if (spelled === token) continue;
+    for (let i = 0; i < 2; i++) if ((await gate(withToken(spelled), ok)).status === 200) served++;
+  }
+  for (const spelled of [`${token}=`, `${token} `, token.replaceAll("-", "+")]) {
+    if (spelled.trim() !== token && (await gate(withToken(spelled), ok)).status === 200) served++;
+  }
+  assert.equal(served, 0);
+  assert.equal((await gate(withToken(token), ok)).status, 200);
+  assert.equal((await gate(withToken(token), ok)).status, 200);
+  assert.equal((await gate(withToken(token), ok)).status, 402);
+});
+
 test("expired token -> 402", async () => {
   let t = 1_000_000;
   const { gate } = setup({ now: () => t });

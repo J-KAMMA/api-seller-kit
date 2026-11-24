@@ -50,6 +50,7 @@ export async function verifyToken(secret, token) {
     if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
     const expected = await hmac(secret, parts[0]);
     if (!constantTimeEqual(expected, fromB64url(parts[1]))) return null;
+    if (parts[1] !== toB64url(expected)) return null; // one spelling only: the counter is kept under this text
     const payload = JSON.parse(new TextDecoder().decode(fromB64url(parts[0])));
     if (!payload || typeof payload !== "object" || payload.v !== 1) return null;
     return { payload, signature: parts[1] };

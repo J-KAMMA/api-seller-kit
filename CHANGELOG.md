@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2 (2026-11-24)
+
+- Monthly tokens are accepted only in the spelling they were issued in. All sellers of monthly plans should update.
+
 ## 0.2.1 (2026-11-24)
 
 - Prepaid records are kept per chain and channel contract. Records of 0.2.0 and older stay usable and closable.
