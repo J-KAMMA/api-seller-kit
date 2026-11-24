@@ -1,0 +1,16 @@
+{
+  // Prepaid example (Avalanche Fuji testnet only). Secret: STORE_SECRET (wrangler secret put STORE_SECRET, 32+ random characters).
+  "name": "my-api-prepaid",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-07-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "name": "SELLER_STORE", "class_name": "SellerKitStore" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SellerKitStore"] }],
+  "vars": {
+    "SELLER": "0xYOUR_ADDRESS",
+    "PAY_TO": "0xYOUR_SPLITTER_FROM_HUB_LISTING",
+    "CHANNEL_CONTRACT": "0xA5E4707344b624A7217b7814dA1b3611Bf4b4559",
+    "RPC_URL": "https://api.avax-test.network/ext/bc/C/rpc",
+    "FACILITATOR_URL": "https://jkamma-facilitator-staging.jkamma-hub.workers.dev"
+  }
+}

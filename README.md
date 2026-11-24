@@ -65,11 +65,23 @@ New sellers use this contract. If you used the first one (`0xd896c44aCdFdfF4d4dD
 
 Each call uses the price per call. A call that fails gives its use back. The channel is closed with the smallest voucher that covers the served calls, so a buyer who raises by the price per call pays exactly for what was served. A buyer who signs further ahead can use the rest for later calls until you close.
 
-`api-seller-close` stops new vouchers on a channel before it sends the transaction. If a run ends with `close_unconfirmed`, run it again: it finishes the same close and never pays twice. Close when no calls are running; a call that fails while its close is being sent cannot be taken out of it any more.
+`api-seller-close` stops new vouchers on a channel before it sends the transaction. If a run ends with `close_unconfirmed`, run it again: it looks at the chain, finishes the same close with the same nonce, and never pays twice. Until then the channel takes no new calls. Calls already running get up to `DRAIN_SECONDS` (60) to end; if that is not enough, `drainTimedOut` names the channel, and a call that fails after that cannot be taken out of the close. `MAX_FEE_GWEI` (200) limits the fee. A call that never reports back counts as running for `prepaid.callTimeoutMs` (10 minutes), then as served.
 
 A reply is read from your API to the end before the buyer gets any of it. If your API fails or breaks off half way, the buyer gets a 502 and the call is not counted. Streaming replies arrive in one piece (8 MB at most).
 
+### Prepaid on Workers
+
+`examples/worker-prepaid/`: the Worker stores vouchers in a Durable Object and holds no seller key. Set a random secret of 32 or more characters (`wrangler secret put STORE_SECRET`), then close from your own machine:
+
+```bash
+STORE_URL=https://YOUR_WORKER/__seller-store STORE_SECRET=… SELLER_PRIVATE_KEY=… RPC_URL=… CHANNEL_CONTRACT=… npx api-seller-close
+```
+
+Without the secret the route does not exist. Keep the secret as safe as your key: it can change your stored vouchers.
+
 ## Store
+
+One store per `payTo` address, shared by everything that takes payments for it. One store per seller and contract set, shared by all instances, and never reset while channels are open or tokens are valid: with an empty store, vouchers and tokens already used count as new.
 
 Prepaid vouchers and monthly quotas are counted in a store. It needs three methods:
 
@@ -90,6 +102,18 @@ Prepaid, and monthly with a quota, refuse to start with a store that has no `com
 
 If the store cannot be reached, or the file lock is not free within 10 seconds, the call is answered with 502 and not served. A lock left by a stopped process on the same machine is removed automatically; after moving the file to another machine, delete `<storePath>.lock` yourself.
 
+### Upgrading from 0.2.1
+
+- `monthly` needs `resource`, the public address of the API. New tokens hold for that path and price; after a price change list the old price in `monthly.acceptPrices`. Tokens issued before 0.3.0 hold until they run out if the quota is unchanged.
+- Selling per call from several instances: pass a shared `store`. With one process, `singleInstance: true` silences the warning.
+- Deposits below `minDepositAtomic` (default: ten calls) are refused. Prepaid is not available on mainnet.
+- A custom store may drop values whose `expiresAt` (unix seconds) has passed if their key starts with `payment:`, and must drop nothing else.
+- `--only-requested` closes only channels whose buyer asked to close; run it on a timer well inside the challenge period. `MIN_AMOUNT` skips small ones otherwise.
+
+Upgrade the gates and `api-seller-close` together, and stop the old ones first. A close that 0.2.1 left unfinished is finished by the next `api-seller-close`; until then that channel takes no calls.
+
+If one 0.2.0 store served two contracts at the same time, the overwritten record cannot be restored: the kit refuses it with `channel_record_mixed` (`mixed_record` when closing) where it can tell.
+
 ### Upgrading from 0.2.0
 
 Stop all 0.2.0 processes before starting 0.2.1 on the same store. Records are now kept per chain and contract, so one store can serve several. Old records are read where their signature fits the configured contract; they are neither moved nor deleted, and the close command finds them. If a channel answers `channel_record_unknown`, the old record belongs to a contract the kit does not know: list it in `prepaid.earlierContracts` (`eip155:43113/0x…`). Only list contracts you used before the current one. Two more changes: a channel being closed answers `channel_closing`, and an unused part of a voucher can be used by a later call.
@@ -104,11 +128,25 @@ Stop all 0.2.0 processes before starting 0.2.1 on the same store. Records are no
 
 - `examples/node-server.mjs`: a Node server.
 - `examples/worker/`: a Cloudflare Worker.
+- `examples/worker-prepaid/`: a Cloudflare Worker with prepaid, closed from your own machine.
 
 ## Notes
 
 - Testnet only. Mainnet needs an audit first.
-- Failures close: if verification or settlement fails, the call is not served and the buyer is not charged.
+- Failures close: if verification fails, or your API fails, the call is not served and nothing is settled. If it stays unclear whether the payment went through, the body is withheld.
+- Every answer to a payment says what became of it, in the `hub-payment-status` header and, in JSON errors, as `payment` and `safeToPayAgain`:
+
+  | `payment` | Status | What a client does |
+  |---|---|---|
+  | `not_taken` | 402, 502, or your API's own status | nothing was settled; paying again is safe |
+  | `unclear` | 409 (502 `store_unavailable`) | it may have been settled. Do not pay again: repeat the same request with the same payment and key |
+  | `settled` | 200, 409, 502 | it was settled; do not pay again. With 502 the reply is still owed: repeat the same request |
+  | `refused` | 402, 413, 502 | this request settled nothing; safe to pay unless the same payment was sent before |
+
+- Set `settlementRpcUrl` (an RPC of the same chain; prepaid's `rpcUrl` is used otherwise). With it the gate finds a payment on chain that the facilitator did not confirm, and can tell when an authorization ran out unused. Without it such a payment stays `unclear`.
+- One payment gets one reply. Several instances must share a store for that, also when you only sell per call; on Workers the gate refuses to start without one. Instances that do not share a store cannot see each other's payments: if two get the same payment at once and the facilitator answers both with a plain success, both serve it.
+- A buyer who sends `hub-idempotency-key` (32 to 200 random characters, new for every payment) can repeat the same request (method, address and body up to 1 MB) after an unclear payment. If it turns out paid, the API is called for that buyer, once more if the first reply was withheld, and the payment is done. A monthly token is given again at any time. Replies are not stored: one that was sent but got lost cannot be fetched again, and neither can a lost prepaid or monthly call. Without the key nothing can be repeated: a payment's signature is public on chain and proves nothing.
+- Only 2xx replies count. A redirect or an error of your API is passed on and costs nothing. Your API gets the request without the payment headers and without conditional ones (`if-none-match` and the like), and must answer within `upstreamTimeoutMs` (5 minutes).
 - Tests: `npm test`.
 
 ---

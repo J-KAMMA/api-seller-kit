@@ -3,7 +3,12 @@
 // Fail closed: any verify/settle problem means the body is never returned. The payment payload is never logged.
 // Optional modes (PREPAID-MONTHLY.md): `prepaid` (hub-channel voucher) and `monthly` (hub-subscription token).
 import { createSubscriptions } from "./subscription.mjs";
-import { createFileStore, isAtomicStore, singleInstanceStore } from "./store.mjs";
+import { ATTEMPT_MS, BodyTooLarge, createPayments, IDEMPOTENCY_HEADER, ownerDigest, paymentId, requestDigest, sha256Hex } from "./payments.mjs";
+import { createSettlementProof } from "./settlement-proof.mjs";
+import { classify, decide, reclassify } from "./settlement-table.mjs";
+import { settledDepth } from "./networks.mjs";
+import { minDeposit } from "./voucher-record.mjs";
+import { createFileStore, createMemoryStore, isAtomicStore, isProcessLocal, singleInstanceStore } from "./store.mjs";
 
 /** @typedef {{
  *   network: string, asset: string, payTo: string, seller: string, priceAtomic: string|number|bigint,
@@ -11,10 +16,10 @@ import { createFileStore, isAtomicStore, singleInstanceStore } from "./store.mjs
  *   maxTimeoutSeconds?: number, tokenName?: string, tokenVersion?: string,
  *   facilitatorHeaders?: Record<string,string>, fetch?: typeof fetch, allowedNetworks?: string[],
  *   allowLocalDevNetwork?: boolean,
- *   prepaid?: { pricePerCallAtomic: string|number|bigint, channelContract: string, minDepositAtomic?: string|number|bigint, rpcUrl?: string, readChannel?: Function, earlierContracts?: string[] },
- *   monthly?: { priceAtomic: string|number|bigint, quota: number|null, subscriptionSecret: string },
+ *   prepaid?: { pricePerCallAtomic: string|number|bigint, channelContract: string, minDepositAtomic?: string|number|bigint, rpcUrl?: string, readChannel?: Function, earlierContracts?: string[], callTimeoutMs?: number },
+ *   monthly?: { priceAtomic: string|number|bigint, quota: number|null, subscriptionSecret: string, acceptPrices?: (string|number|bigint)[] },
  *   store?: { get(key: string): any, set(key: string, value: any): any, compareAndSet?(key: string, expected: any, next: any): any },
- *   singleInstance?: boolean, storePath?: string, now?: () => number
+ *   singleInstance?: boolean, upstreamTimeoutMs?: number, settlementRpcUrl?: string, storePath?: string, now?: () => number
  * }} GateConfig */
 
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -68,12 +73,23 @@ function assertConfig(c) {
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
   if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) bad("facilitatorUrl must be https");
   if (c.network === LOCAL_DEV_NETWORK && !local) bad("local dev network needs a loopback facilitatorUrl");
+  if (c.upstreamTimeoutMs !== undefined && !(Number.isInteger(c.upstreamTimeoutMs) && c.upstreamTimeoutMs > 0)) bad("upstreamTimeoutMs must be a positive integer");
+  if (c.settlementRpcUrl !== undefined) {
+    let rpc;
+    try {
+      rpc = new URL(c.settlementRpcUrl);
+    } catch {
+      bad("settlementRpcUrl invalid");
+    }
+    if (rpc.protocol !== "https:" && !(rpc.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(rpc.hostname))) bad("settlementRpcUrl must be https");
+  }
   if (c.prepaid !== undefined) {
     const p = c.prepaid;
     if (!p || typeof p !== "object") bad("prepaid must be an object");
     if (!/^[1-9]\d{0,29}$/.test(String(p.pricePerCallAtomic))) bad("prepaid.pricePerCallAtomic must be a positive integer");
     if (!ADDRESS.test(String(p.channelContract))) bad("prepaid.channelContract must be a 0x address");
     if (p.minDepositAtomic !== undefined && !/^[1-9]\d{0,29}$/.test(String(p.minDepositAtomic))) bad("prepaid.minDepositAtomic must be a positive integer");
+    if (p.callTimeoutMs !== undefined && !(Number.isInteger(p.callTimeoutMs) && p.callTimeoutMs > 0)) bad("prepaid.callTimeoutMs must be a positive integer");
     if (p.earlierContracts !== undefined && !(Array.isArray(p.earlierContracts) && p.earlierContracts.every((e) => /^eip155:\d{1,12}\/0x[0-9a-fA-F]{40}$/.test(String(e))))) {
       bad("prepaid.earlierContracts must be a list like eip155:43113/0x...");
     }
@@ -93,6 +109,14 @@ function assertConfig(c) {
     if (!m || typeof m !== "object") bad("monthly must be an object");
     if (!/^[1-9]\d{0,29}$/.test(String(m.priceAtomic))) bad("monthly.priceAtomic must be a positive integer");
     if (!(m.quota === null || (Number.isInteger(m.quota) && m.quota > 0))) bad("monthly.quota must be a positive integer or null");
+    if (m.acceptPrices !== undefined && !(Array.isArray(m.acceptPrices) && m.acceptPrices.every((v) => /^[1-9]\d{0,29}$/.test(String(v))))) bad("monthly.acceptPrices must be a list of prices");
+    let resource;
+    try {
+      resource = new URL(c.resource);
+    } catch {
+      bad("monthly needs resource: the public address of this API");
+    }
+    if (!/^https?:$/.test(resource.protocol)) bad("resource must be an http(s) address");
     if (typeof m.subscriptionSecret !== "string" || m.subscriptionSecret.length < 16) bad("monthly.subscriptionSecret must be a string of 16+ characters");
   }
 }
@@ -119,16 +143,21 @@ export function createX402Gate(config) {
     }
     store = singleInstanceStore(store);
   }
-  const resourceOrigin = (request) => {
-    try {
-      return new URL(config.resource ?? request.url).origin;
-    } catch {
-      return "";
-    }
-  };
-  const subs = config.monthly
-    ? createSubscriptions({ seller: config.seller, network: config.network, monthly: config.monthly, store, now: config.now, resourceOrigin })
-    : null;
+  if (!store && config.store && isAtomicStore(config.store)) store = config.store;
+  // Per call only and no shared store: one payment is still served once by this process. With several processes they must share a store.
+  if (!store && config.storePath !== undefined) store = createFileStore(config.storePath);
+  if (globalThis.navigator?.userAgent === "Cloudflare-Workers" && (!store || isProcessLocal(store) || (config.store && !isAtomicStore(config.store)))) {
+    throw new Error("x402 gate config: on Workers requests run in many isolates; pass a shared store with compareAndSet (createDurableObjectStore)");
+  }
+  if ((!store || (config.store && !isAtomicStore(config.store))) && config.singleInstance !== true) {
+    console.warn("x402 gate: payments are remembered by this process only; pass a store with compareAndSet when several instances run, or singleInstance: true");
+  }
+  const subs = config.monthly ? createSubscriptions({ seller: config.seller, network: config.network, monthly: config.monthly, store, now: config.now, resource: config.resource }) : null;
+  const proofRpc = config.settlementRpcUrl ?? config.prepaid?.rpcUrl;
+  const proof = proofRpc ? createSettlementProof({ rpcUrl: proofRpc, chainId: Number(config.network.split(":")[1]), asset: config.asset, payTo: config.payTo, doFetch, depth: settledDepth(config.network) }) : null;
+  const upstreamTimeout = config.upstreamTimeoutMs ?? 300_000;
+  const payments = createPayments(store ?? createMemoryStore(), upstreamTimeout);
+  const now = config.now ?? (() => Math.floor(Date.now() / 1000));
   let channelPromise = null; // viem is only loaded when prepaid is configured
   const channels = () =>
     (channelPromise ??= import("./channel.mjs").then((m) =>
@@ -155,7 +184,7 @@ export function createX402Gate(config) {
       extra: {
         channelContract: config.prepaid.channelContract.toLowerCase(),
         seller: config.seller.toLowerCase(),
-        minDepositAtomic: String(config.prepaid.minDepositAtomic ?? BigInt(config.prepaid.pricePerCallAtomic) * 10n),
+        minDepositAtomic: String(minDeposit(config.prepaid)),
       },
     };
   }
@@ -188,19 +217,31 @@ export function createX402Gate(config) {
     });
   }
 
-  function quote(request, error) {
+  /**
+   * What became of a payment, in the body and in the hub-payment-status header:
+   *   not_taken  nothing was settled; paying (again) is safe
+   *   unclear    it may have been settled; do NOT pay again, repeat the same request with the same payment
+   *   settled    it was settled; do NOT pay again
+   *   refused    this request settled nothing, but an earlier one with the same payment may have
+   */
+  const outcome = (payment) => ({ payment, safeToPayAgain: payment === "not_taken" });
+  const failed = (status, error, payment, headers = {}) => json(status, { error, ...outcome(payment) }, { "hub-payment-status": payment, ...headers });
+
+  function quote(request, error, extra, payment) {
     const accepts = [requirements(request)];
     if (config.prepaid) accepts.push(channelEntry(request));
     if (config.monthly) accepts.push(requirements(request, true));
     const body = { x402Version: 2, accepts };
     if (error) body.error = error;
+    if (extra) body.channel = extra;
+    if (payment) Object.assign(body, outcome(payment));
     // Buyers read the quote from the `payment-required` header (v2) or from the body.
-    return json(402, body, { "payment-required": utf8ToBase64(JSON.stringify(body)) });
+    return json(402, body, { "payment-required": utf8ToBase64(JSON.stringify(body)), ...(payment ? { "hub-payment-status": payment } : {}) });
   }
 
-  async function facilitator(path, paymentPayload, paymentRequirements) {
+  async function facilitator(path, paymentPayload, paymentRequirements, until = Infinity) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FACILITATOR_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), Math.max(1, Math.min(FACILITATOR_TIMEOUT_MS, until - Date.now())));
     try {
       const res = await doFetch(`${base}${path}`, {
         method: "POST",
@@ -209,20 +250,67 @@ export function createX402Gate(config) {
         redirect: "manual", // Workers do not support "error"; a redirect is treated as unavailable below
         signal: controller.signal,
       });
-      if (res.status >= 300 && res.status < 400) return { ok: false, data: null };
+      if (res.status >= 300 && res.status < 400) return { ok: false, status: res.status, data: null };
       const data = await res.json().catch(() => null);
-      return { ok: res.ok, data };
+      return { ok: res.ok, status: res.status, data };
     } catch {
-      return { ok: false, data: null };
+      return { ok: false, status: 0, data: null };
     } finally {
       clearTimeout(timer);
     }
   }
 
-  /** Reads the whole body; null when it is above the cap. Throws when the upstream breaks off. */
-  async function readBody(upstream) {
-    const bytes = new Uint8Array(await upstream.arrayBuffer());
-    return bytes.byteLength > MAX_BODY_BYTES ? null : bytes;
+  /** The seller's API: without the payment headers, with a time limit that also covers reading the body, and never more than the cap. */
+  async function callUpstream(request, next) {
+    const headers = new Headers(request.headers);
+    for (const name of [...REQUEST_HEADERS, VOUCHER_HEADER, SUBSCRIPTION_HEADER, IDEMPOTENCY_HEADER]) headers.delete(name);
+    // A conditional request could be answered with an uncounted 304 that tells the buyer what they came for.
+    for (const name of ["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range"]) headers.delete(name);
+    const controller = new AbortController();
+    let timer;
+    const late = new Promise((_, refuse) => {
+      timer = setTimeout(() => (controller.abort(), refuse(new Error("upstream_timeout"))), upstreamTimeout);
+    });
+    let reader = null;
+    const run = async () => {
+      const upstream = await next(new Request(request, { headers, signal: controller.signal }));
+      if (!(upstream.status >= 200 && upstream.status < 300)) return { upstream };
+      const chunks = [];
+      let size = 0;
+      if (upstream.body) {
+        reader = upstream.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > MAX_BODY_BYTES) {
+            void reader.cancel().catch(() => {});
+            return { upstream, tooLarge: true };
+          }
+          chunks.push(value);
+        }
+      }
+      const bytes = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        bytes.set(c, at);
+        at += c.byteLength;
+      }
+      const out = new Headers(upstream.headers);
+      out.delete("content-length");
+      out.delete("content-encoding");
+      return { upstream, bytes, headers: out };
+    };
+    const work = run();
+    work.catch(() => {});
+    try {
+      return await Promise.race([work, late]);
+    } catch (e) {
+      if (reader) void reader.cancel().catch(() => {});
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function reply(upstream, bytes, headers) {
@@ -234,30 +322,24 @@ export function createX402Gate(config) {
    * Serve an already-authorised call (subscription or voucher): give the use back when upstream fails. Upstream streams are read to the
    * end before the buyer gets the first byte, so a body that breaks off half way is a failed call: nothing is delivered, nothing is counted.
    * Once the complete reply is handed over, the call counts, also when the buyer drops the connection.
+   * Only 2xx counts: a redirect or an error is passed on as it is and costs nothing.
    */
-  async function serveAuthorised(request, next, undo, extraHeaders) {
+  async function serveAuthorised(request, next, undo, extraHeaders, done = null) {
     const rollback = () => undo().catch(() => {}); // a store failure here keeps the use counted; the reply stays the upstream error
-    let upstream, bytes;
+    let r;
     try {
-      upstream = await next(request);
-      if (upstream.status >= 200 && upstream.status < 300) bytes = await readBody(upstream);
+      r = await callUpstream(request, next);
     } catch {
       await rollback();
       return json(502, { error: "upstream_failed" });
     }
-    if (bytes === undefined) {
+    if (!r.bytes) {
       await rollback();
-      return upstream;
+      return r.tooLarge ? json(502, { error: "upstream_too_large" }) : r.upstream;
     }
-    if (bytes === null) {
-      await rollback();
-      return json(502, { error: "upstream_too_large" });
-    }
-    const headers = new Headers(upstream.headers);
-    headers.delete("content-length");
-    headers.delete("content-encoding");
-    for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
-    return reply(upstream, bytes, headers);
+    for (const [k, v] of Object.entries(extraHeaders)) r.headers.set(k, v);
+    if (done) await done().catch(() => {});
+    return reply(r.upstream, r.bytes, r.headers);
   }
 
   return async function gate(request, next) {
@@ -267,7 +349,7 @@ export function createX402Gate(config) {
     if (token) {
       let r;
       try {
-        r = await subs.accept(token, request);
+        r = await subs.accept(token);
       } catch {
         return json(502, { error: "store_unavailable" });
       }
@@ -275,6 +357,7 @@ export function createX402Gate(config) {
       modeError = r.error;
     }
 
+    let channelInfo;
     const voucher = config.prepaid ? request.headers.get(VOUCHER_HEADER) : null;
     if (voucher) {
       let r;
@@ -283,9 +366,10 @@ export function createX402Gate(config) {
       } catch {
         return json(502, { error: "channel_unavailable" });
       }
-      if (r.ok) return serveAuthorised(request, next, r.rollback, { [RECEIPT_HEADER]: r.receipt });
+      if (r.ok) return serveAuthorised(request, next, r.rollback, { [RECEIPT_HEADER]: r.receipt }, r.done);
       if (r.status !== 402) return json(r.status, { error: r.error });
       modeError = r.error;
+      channelInfo = r.channel;
     }
 
     let header = null;
@@ -293,7 +377,7 @@ export function createX402Gate(config) {
       header = request.headers.get(name);
       if (header) break;
     }
-    if (!header) return quote(request, modeError ?? undefined);
+    if (!header) return quote(request, modeError ?? undefined, channelInfo);
     if (header.length > MAX_PAYMENT_HEADER) return quote(request, "payment_header_too_large");
 
     let payload;
@@ -307,62 +391,166 @@ export function createX402Gate(config) {
     // Both requirement sets come from config; the buyer's hint only picks one and the facilitator verifies against it.
     const isMonthly = config.monthly !== undefined && payload.accepted?.extra?.plan === "monthly";
     const reqs = requirements(request, isMonthly);
-    let monthlyBuyer = null;
-    if (isMonthly) {
-      monthlyBuyer = payload.payload?.authorization?.from;
-      if (typeof monthlyBuyer !== "string" || !ADDRESS.test(monthlyBuyer)) return quote(request, "payment_invalid");
+    const payment = paymentId(config.network, config.asset, payload);
+    const owner = payment ? await ownerDigest(request, payment.key) : null;
+    let asked = null;
+    if (owner) {
+      try {
+        asked = await requestDigest(request);
+      } catch (e) {
+        if (e instanceof BodyTooLarge) return failed(413, "body_too_large_for_idempotency_key", "refused");
+        throw e;
+      }
+    }
+
+    /** What to store and to answer for a settled payment. The token is the same whenever it is made. */
+    async function outcomeOf(rec, settled) {
+      const transaction = settled.data.transaction ?? null;
+      const fields = { transaction };
+      if (isMonthly) fields.token = await subs.issue({ buyer: payment.from, payment: (await sha256Hex(payment.key)).slice(0, 32), issuedAt: rec.issuedAt });
+      const receipt = utf8ToBase64(JSON.stringify({ success: true, transaction, network: settled.data.network ?? config.network, payer: settled.data.payer ?? null }));
+      return { fields, receipt };
+    }
+    const paidHeaders = (rec) => ({
+      "hub-payment-status": "settled",
+      ...(rec.receipt ? { "X-PAYMENT-RESPONSE": rec.receipt, "PAYMENT-RESPONSE": rec.receipt } : {}),
+      ...(rec.token ? { [SUBSCRIPTION_HEADER]: rec.token } : {}),
+    });
+    /** Asks the chain. Returns a settlement when it proves that this authorization paid this seller. */
+    const proven = async (startBlock, claimedAt, until) => {
+      if (!proof) return { state: "unclear" };
+      const found = await proof.look({ from: payment.from, nonce: payment.nonce, amount: reqs.amount, validBefore: payment.validBefore, startBlock, claimedAt, until });
+      return found.state === "paid" ? { state: "paid", settled: { data: { transaction: found.transaction, payer: payment.from } } } : found;
+    };
+
+    /** Paid, and the buyer still has no reply: one call to the API. A failed one leaves it owed. */
+    async function deliver(rec) {
+      let r;
+      try {
+        r = await callUpstream(request, next);
+      } catch {
+        r = {};
+      }
+      if (!r.bytes) {
+        await payments.owed(payment.key, rec.id, {}).catch(() => {});
+        return failed(502, r.tooLarge ? "upstream_too_large" : "upstream_failed", "settled", paidHeaders(rec));
+      }
+      if (!(await payments.settled(payment.key, rec.id, {}))) return failed(409, "payment_in_progress", "settled");
+      for (const [k, v] of Object.entries(paidHeaders(rec))) r.headers.set(k, v);
+      return reply(r.upstream, r.bytes, r.headers);
+    }
+
+    /** The buyer who holds the key asks again about a payment whose reply they never had. */
+    async function retry() {
+      const rec = await payments.retry(payment.key);
+      if (rec === null) return failed(409, "payment_in_progress", "unclear");
+      if (rec.state === "delivering") return deliver(rec);
+      // See settlement-table.mjs. The chain is asked first: a facilitator may answer a settled authorization with a failure, because its nonce is used.
+      const until = Date.now() + ATTEMPT_MS;
+      let first = rec.first ?? "ambiguous";
+      let chain = await proven(rec.startBlock, rec.claimedAt, until);
+      let verdict = decide(first, chain.state);
+      if (verdict === "unclear" && first !== "contested") {
+        const before = chain.state;
+        const settled = await facilitator("/settle", payload, reqs, until);
+        const again = classify(settled);
+        if (again === "ok") {
+          first = "ok"; // settled by this very request
+          chain = { state: "paid", settled };
+        } else {
+          first = reclassify(first, again, before);
+          chain = { scannedTo: chain.scannedTo, ...(await proven(chain.scannedTo ?? rec.startBlock, rec.claimedAt, until)) };
+        }
+        verdict = decide(first, chain.state);
+      }
+      if (verdict === "not_taken") {
+        await payments.void(payment.key, rec.id);
+        return quote(request, "payment_expired", undefined, "not_taken");
+      }
+      if (verdict !== "serve") {
+        await payments.unclear(payment.key, rec.id, { first, scannedTo: chain.scannedTo });
+        return verdict === "elsewhere" ? failed(409, "payment_settled_elsewhere", "settled") : failed(409, "settlement_unclear", "unclear");
+      }
+      const { fields, receipt } = await outcomeOf(rec, chain.settled);
+      if (!(await payments.owed(payment.key, rec.id, { ...fields, receipt }))) return failed(409, "payment_in_progress", "settled");
+      const mine = await payments.retry(payment.key);
+      return mine === null ? failed(409, "payment_in_progress", "settled") : deliver(mine);
+    }
+
+    if (payment) {
+      try {
+        const rec = await payments.get(payment.key);
+        if (!payments.isFree(rec)) {
+          if (rec.state === "void") return quote(request, "payment_expired", undefined, "not_taken");
+          const status = ["settled", "owed", "delivering"].includes(rec.state) ? "settled" : "unclear";
+          // Not a 402: a client that takes it for "not paid" would pay twice.
+          if (!owner || rec.owner !== owner) return failed(409, "payment_already_used", status);
+          if (rec.state === "settled") return failed(409, "already_served", "settled", paidHeaders(rec)); // the token again, not the body
+          if (rec.request !== asked) return failed(409, "not_the_same_request", status); // the paid call is the first one
+          return await retry();
+        }
+      } catch {
+        return failed(502, "store_unavailable", "unclear"); // an earlier request with this payment may have settled it
+      }
     }
 
     const verified = await facilitator("/verify", payload, reqs);
-    if (verified.data === null && !verified.ok) return json(502, { error: "facilitator_unavailable" });
-    if (!verified.ok || verified.data?.isValid !== true) {
-      return quote(request, "payment_invalid");
+    if (verified.data === null && !verified.ok) return failed(502, "facilitator_unavailable", "refused");
+    if (!verified.ok || verified.data?.isValid !== true || !payment) {
+      // No record (any more). Whether the same payment was settled before, only the chain can say.
+      const state = payment && proof ? await proof.used(payment) : "unclear";
+      if (state === "used") return failed(409, "payment_already_used", "unclear");
+      return state === "void" ? quote(request, "payment_expired", undefined, "not_taken") : quote(request, "payment_invalid", undefined, "refused");
     }
 
-    let upstream;
+    let claim;
     try {
-      upstream = await next(request);
+      claim = await payments.claim(payment, owner, asked, now());
     } catch {
-      return json(502, { error: "upstream_failed" }); // nothing was settled
+      return failed(502, "store_unavailable", "refused");
     }
-    if (!(upstream.status >= 200 && upstream.status < 300)) {
-      return upstream; // the buyer is not charged for a failed call
-    }
+    if (!claim.rec) return failed(409, "payment_already_used", ["settled", "owed", "delivering"].includes(claim.existing.state) ? "settled" : "unclear");
+    const release = () => payments.release(payment.key, claim.rec.id).catch(() => {}); // nothing was settled
 
-    // Buffer first so the settlement does not race a half-read stream, and so the cap holds.
-    let bytes;
+    let r;
     try {
-      bytes = await readBody(upstream);
+      r = await callUpstream(request, next);
     } catch {
-      return json(502, { error: "upstream_failed" }); // nothing was settled
+      await release();
+      return failed(502, "upstream_failed", "not_taken");
     }
-    if (bytes === null) return json(502, { error: "upstream_too_large" });
+    if (!r.bytes) {
+      await release();
+      if (r.tooLarge) return failed(502, "upstream_too_large", "not_taken");
+      const headers = new Headers(r.upstream.headers);
+      headers.set("hub-payment-status", "not_taken"); // the buyer is not charged for a failed call
+      return new Response(r.upstream.body, { status: r.upstream.status, statusText: r.upstream.statusText, headers });
+    }
 
-    const settled = await facilitator("/settle", payload, reqs);
-    if (!settled.ok || settled.data?.success !== true) {
-      return json(502, { error: "settlement_failed" }); // fail closed: the body is withheld
+    let startBlock = null;
+    try {
+      startBlock = proof ? await proof.startBlock() : null;
+      if (!(await payments.settling(payment.key, claim.rec.id, startBlock))) return failed(409, "payment_in_progress", "unclear"); // another request took it over after the lease
+    } catch {
+      await release();
+      return failed(502, "store_unavailable", "not_taken"); // /settle was not called
     }
-    const receipt = utf8ToBase64(
-      JSON.stringify({
-        success: true,
-        transaction: settled.data.transaction ?? null,
-        network: settled.data.network ?? config.network,
-        payer: settled.data.payer ?? null,
-      }),
-    );
-    const headers = new Headers(upstream.headers);
-    headers.delete("content-length");
-    headers.delete("content-encoding");
-    headers.set("X-PAYMENT-RESPONSE", receipt);
-    headers.set("PAYMENT-RESPONSE", receipt);
-    if (isMonthly) {
-      // The payment is settled, so the body is served even if recording the token fails (the buyer can show the tx).
-      try {
-        headers.set(SUBSCRIPTION_HEADER, await subs.issue(monthlyBuyer, request));
-      } catch {
-        /* no token */
+    const until = Date.now() + ATTEMPT_MS;
+    let settled = await facilitator("/settle", payload, reqs, until);
+    const first = classify(settled);
+    if (first !== "ok") {
+      // The claim is ours and nothing handed out yet: when the chain proves an ambiguous payment, it is served after all.
+      const chain = first === "ambiguous" ? await proven(startBlock, claim.rec.claimedAt, until) : { state: "unclear" };
+      if (decide(first, chain.state) !== "serve") {
+        await payments.unclear(payment.key, claim.rec.id, { first, scannedTo: chain.scannedTo }).catch(() => {});
+        return failed(409, "settlement_unclear", "unclear"); // fail closed: the body is withheld
       }
+      settled = chain.settled;
     }
-    return reply(upstream, bytes, headers);
+    const { fields, receipt } = await outcomeOf(claim.rec, settled).catch(() => ({ fields: null }));
+    const recorded = fields && (await payments.settled(payment.key, claim.rec.id, { ...fields, receipt }).catch(() => false));
+    if (!recorded) return failed(409, "settlement_unclear", "unclear"); // paid, but not on record: handed out only after that (a retry finds it)
+    for (const [k, v] of Object.entries(paidHeaders({ ...fields, receipt }))) r.headers.set(k, v);
+    return reply(r.upstream, r.bytes, r.headers);
   };
 }

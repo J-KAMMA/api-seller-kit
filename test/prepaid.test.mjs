@@ -173,7 +173,7 @@ test("per-call exact path is unchanged when prepaid is on (facilitator still ver
       return new Response(JSON.stringify(path === "/verify" ? { isValid: true } : { success: true, transaction: "0xabc" }));
     },
   });
-  const res = await gate(new Request("https://api.example/echo", { headers: { "payment-signature": b64({ payload: {} }) } }), ok);
+  const res = await gate(new Request("https://api.example/echo", { headers: { "payment-signature": b64({ payload: { authorization: { from: A("4"), nonce: `0x${"1".repeat(64)}` } } }) } }), ok);
   assert.equal(res.status, 200);
   assert.deepEqual(calls, [["/verify", "10000"], ["/settle", "10000"]]);
   assert.ok(res.headers.get("x-payment-response"));
@@ -215,11 +215,12 @@ test("close: dry run lists, real run closes with the highest voucher and marks i
   const { gate, store } = setup();
   await gate(req(await voucher(10000)), ok);
   await gate(req(await voucher(20000)), ok);
-  const readChannel = async () => ({ buyer: buyer.address, seller: SELLER, status: 1, deposit: 1_000_000n });
+  let status = 1;
+  const readChannel = async () => ({ buyer: buyer.address, seller: SELLER, status, deposit: 1_000_000n });
   const sent = [];
   const dry = await closeChannels({ store, chainId: 43113, channelContract: CHANNEL, seller: SELLER, readChannel, sendClose: async () => assert.fail("dry run must not send"), dryRun: true });
   assert.deepEqual(dry.wouldClose, [CHANNEL_ID]);
-  const real = await closeChannels({ store, chainId: 43113, channelContract: CHANNEL, seller: SELLER, readChannel, sendClose: async (id, amt, sig) => (sent.push([id, amt, sig]), "0xtx") });
+  const real = await closeChannels({ store, chainId: 43113, channelContract: CHANNEL, seller: SELLER, readChannel, sendClose: async (id, amt, sig) => (sent.push([id, amt, sig]), (status = 2), "0xtx") });
   assert.deepEqual(real.closed, [CHANNEL_ID]);
   assert.equal(sent[0][1], 20000n);
   assert.equal(sent[0][2], (await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`)).signature);
@@ -234,6 +235,7 @@ test("rpc path: eth_call getChannel is encoded and decoded (fake JSON-RPC)", asy
   const rpc = async (url, init) => {
     const body = JSON.parse(init.body);
     seen.push(body);
+    if (body.method === "eth_chainId") return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0xa869" }));
     const { args } = decodeFunctionData({ abi: CHANNEL_ABI, data: body.params[0].data });
     assert.equal(args[0], CHANNEL_ID);
     const result = encodeFunctionResult({ abi: CHANNEL_ABI, functionName: "getChannel", result: { buyer: buyer.address, seller: SELLER, token: USDC, deposit: 1_000_000n, closeRequestedAt: 0n, status: 1 } });

@@ -19,10 +19,11 @@ function gateFor(env, origin) {
     payTo: env.PAY_TO,
     priceAtomic: env.PRICE_ATOMIC ?? "10000",
     facilitatorUrl: env.FACILITATOR_URL,
+    settlementRpcUrl: env.RPC_URL ?? "https://api.avax-test.network/ext/bc/C/rpc",
     description: "echo (Hub API market sample, testnet)",
-    resource: `${origin}/echo`,
+    resource: env.PUBLIC_URL ?? `${origin}/echo`, // 公開の住所を決めて置く（PUBLIC_URL）。呼び出しの Host には従わない
     monthly: env.SUBSCRIPTION_SECRET ? { priceAtomic: env.MONTHLY_PRICE_ATOMIC ?? "50000", quota: Number(env.MONTHLY_QUOTA ?? 5), subscriptionSecret: env.SUBSCRIPTION_SECRET } : undefined,
-    store: env.SUBSCRIPTION_SECRET ? createDurableObjectStore(env.SELLER_STORE) : undefined,
+    store: createDurableObjectStore(env.SELLER_STORE), // 月額の回数と、支払い1件につき返事1つ
     // 同じアカウントの Worker どうしは workers.dev で呼べないので、サービス バインディングで呼ぶ（宛先の住所は公開のまま＝合言葉なしの道）。
     fetch: env.FACILITATOR ? (input, init) => env.FACILITATOR.fetch(new Request(input, init)) : undefined,
   });

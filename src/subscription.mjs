@@ -1,5 +1,5 @@
 // Monthly subscription token (HMAC-SHA256) and quota counter. Token format (PREPAID-MONTHLY.md):
-//   base64url(JSON {v:1, seller, buyer, resource, network, expiresAt, quota}) + "." + base64url(HMAC(secret, payloadPart))
+//   base64url(JSON {v:2, seller, buyer, resource, path, price, network, expiresAt, quota, payment}) + "." + base64url(HMAC(secret, payloadPart))
 
 import { casUpdate } from "./store.mjs";
 
@@ -52,7 +52,7 @@ export async function verifyToken(secret, token) {
     if (!constantTimeEqual(expected, fromB64url(parts[1]))) return null;
     if (parts[1] !== toB64url(expected)) return null; // one spelling only: the counter is kept under this text
     const payload = JSON.parse(new TextDecoder().decode(fromB64url(parts[0])));
-    if (!payload || typeof payload !== "object" || payload.v !== 1) return null;
+    if (!payload || typeof payload !== "object" || (payload.v !== 1 && payload.v !== 2)) return null;
     return { payload, signature: parts[1] };
   } catch {
     return null;
@@ -61,12 +61,16 @@ export async function verifyToken(secret, token) {
 
 /**
  * @param {{ seller: string, network: string, monthly: { quota: number|null, subscriptionSecret: string },
- *           store: { get(k:string):any, compareAndSet(k:string,expected:any,next:any):any }, now?: () => number, resourceOrigin: (request: Request) => string }} o
+ *           store: { get(k:string):any, compareAndSet(k:string,expected:any,next:any):any }, now?: () => number, resource: string }} o
  */
 export function createSubscriptions(o) {
   const { monthly, store } = o;
   const now = o.now ?? (() => Math.floor(Date.now() / 1000));
   const seller = o.seller.toLowerCase();
+  // From the config only: the Host header of a request says nothing about which API it is.
+  const { origin, pathname } = new URL(o.resource);
+  const price = String(monthly.priceAtomic);
+  const prices = [price, ...(monthly.acceptPrices ?? []).map(String)];
   /** A counter we cannot read must not count as zero. */
   function used(rec) {
     if (rec === null) return 0;
@@ -75,38 +79,36 @@ export function createSubscriptions(o) {
   }
 
   return {
-    /** Issue a token after a settled monthly payment. `buyer` is the EIP-3009 `from`. */
-    async issue(buyer, request) {
-      // The token is fully determined by its fields, so two purchases by one buyer in the same second would share a token and a counter.
-      // Claim the counter with compare-and-set; when it is taken, move to the next second to get a token of its own.
-      for (let extra = 0; extra < 60; extra++) {
-        const payload = {
-          v: 1,
-          seller,
-          buyer: String(buyer).toLowerCase(),
-          resource: o.resourceOrigin(request),
-          network: o.network,
-          expiresAt: now() + PERIOD_DAYS * 86400 + extra,
-          quota: monthly.quota ?? null,
-        };
-        const token = await signToken(monthly.subscriptionSecret, payload);
-        // the purchasing call is the first use
-        const claimed = await casUpdate(store, `quota:${token.split(".")[1]}`, (rec) =>
-          rec === null ? { next: { count: 1 }, result: true } : { result: false },
-        );
-        if (claimed) return token;
-      }
-      throw new Error("token_unavailable");
+    /** The token of one settled payment: always the same one, however often and wherever it is issued. The purchasing call is its first use. */
+    async issue({ buyer, payment, issuedAt }) {
+      const token = await signToken(monthly.subscriptionSecret, {
+        v: 2,
+        seller,
+        buyer: String(buyer).toLowerCase(),
+        resource: origin,
+        path: pathname,
+        price,
+        network: o.network,
+        expiresAt: issuedAt + PERIOD_DAYS * 86400,
+        quota: monthly.quota ?? null,
+        payment,
+      });
+      await casUpdate(store, `quota:${token.split(".")[1]}`, (rec) => (rec === null ? { next: { count: 1 } } : {}));
+      return token;
     },
 
     /** @returns {Promise<{ok:true, rollback:()=>Promise<void>}|{ok:false, error:string}>} */
-    async accept(token, request) {
+    async accept(token) {
       const v = await verifyToken(monthly.subscriptionSecret, token);
       if (!v) return { ok: false, error: "subscription_invalid" };
       const p = v.payload;
       if (p.seller !== seller || p.network !== o.network) return { ok: false, error: "subscription_invalid" };
       if (typeof p.buyer !== "string" || !ADDRESS.test(p.buyer)) return { ok: false, error: "subscription_invalid" };
-      if (p.resource !== o.resourceOrigin(request)) return { ok: false, error: "subscription_wrong_resource" };
+      if (p.v === 2) {
+        if (p.path !== pathname) return { ok: false, error: "subscription_wrong_resource" };
+        if (!prices.includes(p.price)) return { ok: false, error: "subscription_wrong_plan" };
+      } else if (p.quota !== (monthly.quota ?? null)) return { ok: false, error: "subscription_wrong_plan" }; // issued before 0.3.0 (runs out within 30 days): at least the same quota
+      if (p.resource !== origin) return { ok: false, error: "subscription_wrong_resource" };
       if (!Number.isInteger(p.expiresAt) || p.expiresAt <= now()) return { ok: false, error: "subscription_expired" };
       if (!(p.quota === null || (Number.isInteger(p.quota) && p.quota > 0))) return { ok: false, error: "subscription_invalid" };
       // the signed quota is the authority; the counter lives in the store

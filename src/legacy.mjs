@@ -15,6 +15,11 @@ export const VOUCHER_TYPES = {
 /** Contracts older kits were set up with, oldest first. A contract's own records can be followed only by those of later ones. */
 const KNOWN = ["eip155:43113/0xd896c44acdfdff4d4dd1298b19c6a668c9e01c11", "eip155:43113/0xa5e4707344b624a7217b7814da1b3611bf4b4559"];
 
+function laterContracts(chainId, contract) {
+  const at = KNOWN.indexOf(`eip155:${chainId}/${contract.toLowerCase()}`);
+  return at === -1 ? [] : KNOWN.slice(at + 1);
+}
+
 export function earlierContracts(chainId, contract, extra = []) {
   const at = KNOWN.indexOf(`eip155:${chainId}/${contract.toLowerCase()}`);
   return [...(at === -1 ? KNOWN : KNOWN.slice(0, at)), ...extra.map((e) => e.toLowerCase())];
@@ -54,6 +59,7 @@ async function signedFor(chainId, contract, channelId, amount, signature, buyer)
  * What the unscoped record of a channel means for one contract:
  *   { record: null }   none, or it belongs to an earlier contract: the channel starts at zero here
  *   { record }         it is this contract's: go on from it
+ *   { mixed: true }    a later contract wrote over it: what was used here is lost, refuse
  *   { unknown: true }  it belongs to a contract nobody named: refuse, it may hide vouchers already used here
  */
 export async function legacyRecord({ store, chainId, contract, channelId, buyer, earlier }) {
@@ -68,6 +74,10 @@ export async function legacyRecord({ store, chainId, contract, channelId, buyer,
     for (const e of earlier) {
       const [network, address] = e.split("/");
       if (await signedFor(Number(network.slice(7)), address, channelId, amount, signature, buyer)) return { record: null, other: e };
+    }
+    for (const e of laterContracts(chainId, contract)) {
+      const [network, address] = e.split("/");
+      if (await signedFor(Number(network.slice(7)), address, channelId, amount, signature, buyer)) return { mixed: true };
     }
   }
   return { unknown: true };

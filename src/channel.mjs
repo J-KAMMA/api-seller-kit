@@ -3,7 +3,7 @@
 import { decodeFunctionResult, encodeFunctionData, recoverTypedDataAddress } from "viem";
 import { earlierContracts, legacyRecord, VOUCHER_TYPES } from "./legacy.mjs";
 import { casUpdate } from "./store.mjs";
-import { channelKeys, giveBack, isClaimed, recordState, takeUse } from "./voucher-record.mjs";
+import { channelKeys, endCall, isClaimed, keepVoucher, minDeposit, recordState, takeUse } from "./voucher-record.mjs";
 
 export const CHANNEL_ABI = [
   {
@@ -62,26 +62,31 @@ function utf8ToBase64(text) {
   return btoa(bin);
 }
 
-/** JSON-RPC eth_call getChannel. Returns {buyer, seller, token, deposit: bigint, closeRequestedAt: bigint, status: number}. Throws on any problem. */
-export async function readChannelViaRpc({ rpcUrl, channelContract, channelId, doFetch = (input, init) => globalThis.fetch(input, init) }) {
-  const data = encodeFunctionData({ abi: CHANNEL_ABI, functionName: "getChannel", args: [channelId] });
+async function rpcCall({ rpcUrl, method, params, doFetch }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
   try {
     const res = await doFetch(rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: channelContract, data }, "latest"] }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
       redirect: "manual",
       signal: controller.signal,
     });
     const body = await res.json();
     if (!res.ok || typeof body?.result !== "string") throw new Error("rpc_error");
-    const r = decodeFunctionResult({ abi: CHANNEL_ABI, functionName: "getChannel", data: body.result });
-    return { ...r, deposit: BigInt(r.deposit), closeRequestedAt: BigInt(r.closeRequestedAt), status: Number(r.status) };
+    return body.result;
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** JSON-RPC eth_call getChannel. Returns {buyer, seller, token, deposit: bigint, closeRequestedAt: bigint, status: number}. Throws on any problem. */
+export async function readChannelViaRpc({ rpcUrl, channelContract, channelId, doFetch = (input, init) => globalThis.fetch(input, init) }) {
+  const data = encodeFunctionData({ abi: CHANNEL_ABI, functionName: "getChannel", args: [channelId] });
+  const result = await rpcCall({ rpcUrl, method: "eth_call", params: [{ to: channelContract, data }, "latest"], doFetch });
+  const r = decodeFunctionResult({ abi: CHANNEL_ABI, functionName: "getChannel", data: result });
+  return { ...r, deposit: BigInt(r.deposit), closeRequestedAt: BigInt(r.closeRequestedAt), status: Number(r.status) };
 }
 
 /**
@@ -99,10 +104,28 @@ export function createChannelHandler(o) {
   const asset = o.asset.toLowerCase();
   const keys = channelKeys(chainId, contract);
   const earlier = earlierContracts(chainId, contract, prepaid.earlierContracts);
-  const read = prepaid.readChannel ?? ((channelId) => readChannelViaRpc({ rpcUrl: prepaid.rpcUrl, channelContract: contract, channelId, doFetch: o.doFetch }));
+  let chainChecked = null; // once per process: the RPC really is on the configured chain
+  const read =
+    prepaid.readChannel ??
+    (async (channelId) => {
+      const channel = await readChannelViaRpc({ rpcUrl: prepaid.rpcUrl, channelContract: contract, channelId, doFetch: o.doFetch });
+      chainChecked ??= rpcCall({ rpcUrl: prepaid.rpcUrl, method: "eth_chainId", params: [], doFetch: o.doFetch }).then((id) => {
+        if (Number(id) !== chainId) throw new Error("rpc_on_another_chain");
+      });
+      try {
+        await chainChecked;
+      } catch (e) {
+        chainChecked = null;
+        throw e;
+      }
+      return channel;
+    });
+  let warned = false;
+  const smallest = minDeposit(prepaid);
+  const callTimeout = prepaid.callTimeoutMs ?? 600_000;
   const reject = (error) => ({ ok: false, status: 402, error });
 
-  /** @returns {Promise<{ok:true, receipt:string, rollback:()=>Promise<void>}|{ok:false, status:number, error:string}>} */
+  /** @returns {Promise<{ok:true, receipt:string, rollback:()=>Promise<void>, done:()=>Promise<void>}|{ok:false, status:number, error:string}>} */
   async function accept(headerValue) {
     if (typeof headerValue !== "string" || headerValue.length > MAX_VOUCHER_HEADER) return reject("voucher_invalid");
     let v;
@@ -130,6 +153,7 @@ export function createChannelHandler(o) {
     if (String(ch.seller).toLowerCase() !== seller) return reject("channel_wrong_seller");
     if (String(ch.token).toLowerCase() !== asset) return reject("channel_wrong_token");
     const deposit = BigInt(ch.deposit);
+    if (deposit < smallest) return reject("deposit_too_small");
     if (cumulative > deposit) return reject("voucher_exceeds_deposit");
 
     let signer;
@@ -150,37 +174,65 @@ export function createChannelHandler(o) {
     const signature = v.signature.toLowerCase();
     // Count the call and keep the voucher BEFORE the upstream call, so a crash never loses a promise we served.
     let legacy = null;
-    if (((await store.get(key)) ?? null) === null) {
+    let info = null;
+    const fresh = ((await store.get(key)) ?? null) === null;
+    if (fresh) {
       const found = await legacyRecord({ store, chainId, contract, channelId, buyer: ch.buyer, earlier });
+      if (found.mixed) return reject("channel_record_mixed");
       if (found.unknown) return reject("channel_record_unknown");
       legacy = found.record;
+      if (legacy === null && cumulative >= price * 2n && !warned) {
+        warned = true;
+        console.warn("x402 gate: a channel without a record starts above the price per call; if this store replaced another one, vouchers already used may be used again");
+      }
     }
-    const taken = await casUpdate(store, key, (stored) => {
-      const prev = stored ?? legacy;
-      const state = recordState(prev); // throws on a record we cannot read: fail closed
-      if (prev?.closed) return { result: "channel_not_open" };
-      if (isClaimed(prev)) return { result: "channel_closing" }; // being closed: what we accept now could not be claimed any more
-      if (cumulative < state.used + price) return { result: "voucher_not_increasing" };
-      return { next: takeUse(prev, price, cumulative, signature, deposit), result: "ok" };
-    });
-    if (taken !== "ok") return reject(taken);
-
-    /** Gives back this one call, on top of whatever other calls did meanwhile. */
-    const rollback = () => casUpdate(store, key, (cur) => ({ next: giveBack(cur, price) }));
-
-    try {
+    if (fresh) {
+      // Listed before its first record, so that no record is ever missing from the list. A listed channel without a record is skipped when closing.
       await casUpdate(store, keys.index, (index) => {
         const list = Array.isArray(index) ? index : [];
         return list.includes(channelId) ? {} : { next: [...list, channelId] };
       });
-    } catch (e) {
-      await rollback().catch(() => {});
-      throw e;
     }
+    const call = { id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`, expiry: Date.now() + callTimeout };
+    const take = () => casUpdate(store, key, (stored) => {
+      const prev = stored ?? legacy;
+      const state = recordState(prev); // throws on a record we cannot read: fail closed
+      if (prev?.closed) return { result: "channel_not_open" };
+      if (isClaimed(prev)) return { result: "channel_closing" }; // being closed: what we accept now could not be claimed any more
+      info = { usedAtomic: state.used.toString(), nextAtomic: (state.used + price).toString() };
+      if (stored?.calls?.[call.id]) return { result: "ok" }; // written by the attempt whose answer was lost
+      if (cumulative < state.used + price) {
+        // no call for it, but the close may need it: vouchers can arrive out of order
+        const kept = stored ? keepVoucher(stored, cumulative, signature) : null;
+        return { ...(kept ? { next: kept } : {}), result: "voucher_not_increasing" };
+      }
+      return { next: takeUse(prev, price, cumulative, signature, deposit, call), result: "ok" };
+    });
+    let taken;
+    try {
+      taken = await take();
+    } catch (e) {
+      // The write may have arrived although its answer did not: look, so that the buyer is not charged for a refused call.
+      let arrived = false;
+      for (let i = 0; i < 4 && !arrived; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, 50 * i));
+        arrived = Boolean((await store.get(key).catch(() => null))?.calls?.[call.id]);
+      }
+      if (!arrived) throw e;
+      taken = "ok";
+    }
+    // The signature proved that this is the buyer: where the channel stands is theirs to know.
+    if (taken !== "ok") return { ...reject(taken), ...(taken === "voucher_not_increasing" ? { channel: { channelId, ...info } } : {}) };
+
+    /** Gives back this one call, on top of whatever other calls did meanwhile. */
+    const rollback = () => casUpdate(store, key, (cur) => ({ next: endCall(cur, call.id, price, true) }));
+    /** The call was served. Only ends its entry, so that a close need not wait for it; when this fails the entry runs out by itself. */
+    const done = () => casUpdate(store, key, (cur) => ({ next: endCall(cur, call.id, price, false) }));
+
     const receipt = utf8ToBase64(
       JSON.stringify({ channelId, cumulativeAmount: cumulative.toString(), remainingAtomic: (deposit - cumulative).toString() }),
     );
-    return { ok: true, receipt, rollback };
+    return { ok: true, receipt, rollback, done };
   }
 
   return { accept };

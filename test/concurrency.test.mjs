@@ -188,16 +188,18 @@ test("close refuses vouchers while its transaction is in flight, keeps the store
   const gate = channelGate(store);
   await useVoucher(gate, await voucher(10000));
   const v2 = await voucher(20000);
+  let status = 1;
   const out = await closeChannels({
     store,
     chainId: 43113,
     channelContract: A("c"),
     seller: A("3"),
-    readChannel: async () => ({ seller: A("3"), status: 1, deposit: 1_000_000n }),
+    readChannel: async () => ({ seller: A("3"), status, deposit: 1_000_000n }),
     sendClose: async () => {
       const res = await useVoucher(gate, v2);
       assert.equal(res.status, 402);
       assert.equal((await res.json()).error, "channel_closing");
+      status = 2;
       return "0xtx";
     },
   });

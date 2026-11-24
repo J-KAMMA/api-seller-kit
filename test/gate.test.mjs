@@ -13,7 +13,7 @@ const cfg = {
   description: "echo",
   resource: "https://api.example/echo",
 };
-const payment = Buffer.from(JSON.stringify({ x402Version: 2, accepted: {}, payload: { signature: "0xsecret" } })).toString("base64");
+const payment = Buffer.from(JSON.stringify({ x402Version: 2, accepted: {}, payload: { signature: "0xsecret", authorization: { from: A("4"), nonce: `0x${"1".repeat(64)}` } } })).toString("base64");
 
 /** Fake facilitator: records calls, answers per `plan`. */
 function fake(plan = {}) {
@@ -97,7 +97,7 @@ test("settle fails -> 502 and the body is withheld", async () => {
     const f = fake({ "/settle": settle });
     const gate = createX402Gate({ ...cfg, fetch: f.fetch });
     const res = await gate(paid(), upstreamOk);
-    assert.equal(res.status, 502);
+    assert.equal(res.status, 409);
     const text = await res.text();
     assert.ok(!text.includes("echo"));
     assert.equal(res.headers.get("x-payment-response"), null);

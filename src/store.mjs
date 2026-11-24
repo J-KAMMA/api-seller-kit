@@ -10,17 +10,17 @@ const BUSY = new Set(["EPERM", "EACCES", "EBUSY"]); // Windows: the file is bein
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const jitter = (max) => 1 + Math.floor(Math.random() * max);
 
-function stable(value) {
+export function stableJson(value) {
   if (value === undefined || value === null) return "null";
   if (typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stable(value[k])}`).join(",")}}`;
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(",")}}`;
 }
 
 /** Equality of JSON values, whatever the key order. null and undefined both mean "absent". */
 export function sameJson(a, b) {
-  return stable(a) === stable(b);
+  return stableJson(a) === stableJson(b);
 }
 
 export function isAtomicStore(store) {
@@ -68,21 +68,40 @@ export async function casUpdate(store, key, decide) {
   throw new Error("store_contended");
 }
 
+/** Payment records carry `expiresAt` (unix seconds): a store may drop them afterwards. Nothing else is ever dropped. */
+export function isExpired(key, value, now = Date.now() / 1000) {
+  return key.startsWith("payment:") && typeof value?.expiresAt === "number" && value.expiresAt < now;
+}
+
+const processLocal = new WeakSet();
+/** Does this store live in one process (or Worker isolate) only? */
+export function isProcessLocal(store) {
+  return processLocal.has(store);
+}
+
 export function createMemoryStore(initial = {}) {
   const map = new Map(Object.entries(initial));
-  return {
+  let writes = 0;
+  const sweep = () => {
+    if (++writes % 256 === 0) for (const [k, v] of map) if (isExpired(k, v)) map.delete(k);
+  };
+  const store = {
     async get(key) {
       return map.has(key) ? structuredClone(map.get(key)) : null;
     },
     async set(key, value) {
+      sweep();
       map.set(key, structuredClone(value));
     },
     async compareAndSet(key, expected, next) {
       if (!sameJson(map.has(key) ? map.get(key) : null, expected)) return false; // no await up to the write
+      sweep();
       map.set(key, structuredClone(next));
       return true;
     },
   };
+  processLocal.add(store);
+  return store;
 }
 
 /**
@@ -123,9 +142,9 @@ export function createFileStore(path, { lockTimeoutMs = 10_000, staleMs = 10_000
     return data;
   }
 
-  async function readLock(fs) {
+  async function readLock(fs, file = lockPath) {
     try {
-      return JSON.parse(await whileBusy(() => fs.readFile(lockPath, "utf8")));
+      return JSON.parse(await whileBusy(() => fs.readFile(file, "utf8")));
     } catch {
       return null; // gone, or still being written
     }
@@ -148,36 +167,40 @@ export function createFileStore(path, { lockTimeoutMs = 10_000, staleMs = 10_000
   async function acquire(fs, host) {
     const token = globalThis.crypto?.randomUUID?.() ?? `${process.pid}-${Date.now()}-${Math.random()}`;
     const deadline = Date.now() + lockTimeoutMs;
+    // Written first under a name of its own, then linked: a lock appears complete or not at all, also when this process is killed.
+    const own = `${path}.lock.${token}`;
+    await fs.writeFile(own, JSON.stringify({ pid: process.pid, host, at: Date.now(), token }), { mode: 0o600 });
     const create = async (file) => {
-      let handle;
       try {
-        handle = await fs.open(file, "wx", 0o600);
+        await fs.link(own, file);
+        return true;
       } catch (e) {
         if (e?.code === "EEXIST" || BUSY.has(e?.code)) return false;
         throw e;
       }
-      try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, host, at: Date.now(), token }));
-        await handle.close();
-      } catch (e) {
-        await handle.close().catch(() => {});
-        await fs.rm(file, { force: true }).catch(() => {}); // ours: created just above
-        throw e;
-      }
-      return true;
     };
-    for (;;) {
-      if (await create(lockPath)) return token;
-      if (abandoned(await readLock(fs), host) && (await create(stealPath))) {
-        // One remover at a time, and the lock is looked at again under the guard, so a lock taken meanwhile is never removed.
-        try {
-          if (abandoned(await readLock(fs), host)) await whileBusy(() => fs.rm(lockPath, { force: true }));
-        } finally {
-          await whileBusy(() => fs.rm(stealPath, { force: true }));
+    try {
+      return await wait();
+    } finally {
+      await fs.rm(own, { force: true }).catch(() => {});
+    }
+
+    async function wait() {
+      for (;;) {
+        if (await create(lockPath)) return token;
+        const stealer = await readLock(fs, stealPath);
+        if (abandoned(stealer, host)) await fs.rm(stealPath, { force: true }).catch(() => {}); // died while removing a lock
+        if (abandoned(await readLock(fs), host) && (await create(stealPath))) {
+          // One remover at a time, and the lock is looked at again under the guard, so a lock taken meanwhile is never removed.
+          try {
+            if (abandoned(await readLock(fs), host)) await whileBusy(() => fs.rm(lockPath, { force: true }));
+          } finally {
+            await whileBusy(() => fs.rm(stealPath, { force: true }));
+          }
         }
+        if (Date.now() > deadline) throw new Error(`file store: ${lockPath} is held; nothing was written (if no process uses the store, delete it, and ${stealPath} if it exists)`);
+        await sleep(jitter(15));
       }
-      if (Date.now() > deadline) throw new Error(`file store: ${lockPath} is held; nothing was written (if no process uses the store, delete the lock file)`);
-      await sleep(jitter(15));
     }
   }
 
@@ -193,11 +216,23 @@ export function createFileStore(path, { lockTimeoutMs = 10_000, staleMs = 10_000
       try {
         const data = await load(fs);
         if (change(data) === false) return false;
+        for (const k of Object.keys(data)) if (isExpired(k, data[k])) delete data[k];
         tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-        await fs.writeFile(tmp, JSON.stringify(data), { mode: 0o600 });
+        const handle = await fs.open(tmp, "wx", 0o600);
+        try {
+          await handle.writeFile(JSON.stringify(data));
+          await handle.sync(); // on the disk before it gets the name
+        } finally {
+          await handle.close();
+        }
         if ((await readLock(fs))?.token !== token) throw new Error("file store: lock lost; nothing was written");
         await whileBusy(() => fs.rename(tmp, path));
         tmp = null;
+        if (process.platform !== "win32") {
+          // the new name too; not every file system can do it
+          const dir = await fs.open(nodePath.dirname(nodePath.resolve(path)), "r").catch(() => null);
+          if (dir) await dir.sync().catch(() => {}).finally(() => dir.close());
+        }
         return true;
       } finally {
         if (tmp) await fs.rm(tmp, { force: true }).catch(() => {});

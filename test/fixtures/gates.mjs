@@ -58,5 +58,6 @@ export const quotaKey = (token) => `quota:${token.split(".")[1]}`;
 const upstream = (status) => async () => new Response("{}", { status: typeof status === "function" ? await status() : status });
 export const useVoucher = (gate, v, status = 200) => gate(new Request(URL_, { headers: { "hub-channel-voucher": v } }), upstream(status));
 export const useToken = (gate, t, status = 200) => gate(new Request(URL_, { headers: { "hub-subscription": t } }), upstream(status));
+let nonces = 0;
 export const purchase = (gate) =>
-  gate(new Request(URL_, { headers: { "payment-signature": b64({ accepted: { extra: { plan: "monthly" } }, payload: { authorization: { from: A("4") } } }) } }), upstream(200));
+  gate(new Request(URL_, { headers: { "payment-signature": b64({ accepted: { extra: { plan: "monthly" } }, payload: { authorization: { from: A("4"), nonce: `0x${(++nonces).toString(16).padStart(64, "0")}` } } }) } }), upstream(200));

@@ -43,8 +43,9 @@ const gate = createX402Gate({
   payTo: need("PAY_TO"), // your splitter address, as shown on your Hub listing
   priceAtomic: env.PRICE_ATOMIC ?? "10000", // 0.01 USDC (6 decimals)
   facilitatorUrl: env.FACILITATOR_URL ?? (network === "eip155:43113" ? "https://jkamma-facilitator-staging.jkamma-hub.workers.dev" : "http://127.0.0.1:8790"), // Fuji: Hub's testnet facilitator, no token needed once listed on Hub
+  settlementRpcUrl: env.RPC_URL ?? (network === "eip155:43113" ? "https://api.avax-test.network/ext/bc/C/rpc" : undefined), // finds a payment on chain when the settlement answer is lost
   description: "echo (reference API)",
-  resource: env.PUBLIC_URL ? `${env.PUBLIC_URL}/echo` : undefined,
+  resource: `${env.PUBLIC_URL ?? `http://127.0.0.1:${env.PORT ?? 8800}`}/echo`, // the address buyers call; never taken from a request
   facilitatorHeaders: env.FACILITATOR_TOKEN ? { authorization: `Bearer ${env.FACILITATOR_TOKEN}` } : undefined,
   prepaid,
   monthly,

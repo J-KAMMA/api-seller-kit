@@ -10,7 +10,20 @@ const LEGACY = `channel:${CHANNEL_ID}`;
 const HOUR = 60 * 60 * 1000;
 const sigOf = (v) => JSON.parse(Buffer.from(v, "base64").toString()).signature.toLowerCase();
 const open = { buyer: BUYER, seller: A("3"), status: 1, deposit: 1_000_000n };
-const close = (store, sendClose, readChannel = async () => open) => closeChannels({ store, chainId: 43113, channelContract: A("c"), seller: A("3"), readChannel, sendClose });
+/** The fake chain: a close that returns is mined, per store and channel. */
+const mined = new WeakMap();
+const isMined = (store, id) => mined.get(store)?.has(id);
+const mine = (store, id) => void (mined.get(store) ?? mined.set(store, new Set()).get(store)).add(id);
+const close = (store, sendClose, readChannel = async () => open) =>
+  closeChannels({
+    store, chainId: 43113, channelContract: A("c"), seller: A("3"),
+    readChannel: async (id) => (isMined(store, id) ? { ...open, status: 2 } : readChannel(id)),
+    sendClose: async (id, ...rest) => {
+      const tx = await sendClose(id, ...rest);
+      mine(store, id);
+      return tx;
+    },
+  });
 const notSent = () => Object.assign(new Error("x"), { closeNotSent: true });
 
 /** A call whose upstream answers when told to. */
@@ -83,6 +96,60 @@ test("random overlaps: never unpaid, never above the served calls, whatever fail
   }
 });
 
+test("two gates, random overlaps and failures, closing in the middle: counts, uses given back and the settlement agree", async () => {
+  let seed = 11;
+  const rand = (n) => (seed = (seed * 1103515245 + 12345) % 2147483648) % n;
+  const vs = await Promise.all(Array.from({ length: 12 }, (_, i) => voucher((i + 1) * 10000)));
+  let failedWhileClosing = 0;
+  for (let round = 0; round < 40; round++) {
+    const store = createMemoryStore();
+    const gates = [channelGate(store), channelGate(store)];
+    const closeAt = 2 + rand(8);
+    let flight = [];
+    let served = 0;
+    let failed = 0;
+    let closing = null;
+    let sent;
+    const used = async () => BigInt((await store.get(KEY)).used);
+    const end = async () => {
+      const [call] = flight.splice(rand(flight.length), 1);
+      const status = rand(3) ? 200 : 500;
+      assert.equal(await call(status), status);
+      if (status === 200) served++;
+      else {
+        failed++;
+        if (closing) failedWhileClosing++;
+      }
+      const inFlight = flight.length;
+      assert.equal(await used(), BigInt(served + inFlight) * 10000n, `round ${round}`);
+    };
+    for (let next = 0; next < closeAt; ) {
+      if (flight.length === 0 || rand(2)) flight.push(await pending(gates[rand(2)], vs[next++]));
+      else await end();
+    }
+    closing = closeChannels({
+      store, chainId: 43113, channelContract: A("c"), seller: A("3"), drainMs: 10_000, challengeSeconds: 86_400,
+      readChannel: async (id) => ({ ...open, status: isMined(store, id) ? 2 : 1 }), sendClose: async (id, amount) => ((sent = amount), mine(store, id), "0xtx"),
+    });
+    if (flight.length) {
+      while (!(await store.get(KEY)).closing) await new Promise((r) => setTimeout(r, 1));
+      for (const gate of gates) assert.equal((await useVoucher(gate, vs[closeAt])).status, 402); // nothing is taken in that the close does not pay
+    }
+    while (flight.length) await end();
+    const result = await closing;
+    assert.deepEqual(result.drainTimedOut, []);
+    assert.equal(sent, served === 0 ? undefined : BigInt(served) * 10000n); // exactly the served calls, also when calls failed after the claim
+    assert.ok(served + failed === closeAt);
+    if (served === 0) {
+      assert.deepEqual(result.skipped.map((r) => r.reason), ["no_voucher"]);
+      continue;
+    }
+    assert.deepEqual(result.closed, [CHANNEL_ID]);
+    assert.equal((await useVoucher(gates[0], vs[11])).status, 402); // closed
+  }
+  assert.ok(failedWhileClosing > 0); // the case is exercised
+});
+
 test("a buyer that raises by more than the price: served calls are paid, the rest stays usable", async () => {
   const store = createMemoryStore();
   const gate = channelGate(store);
@@ -96,15 +163,15 @@ test("a buyer that raises by more than the price: served calls are paid, the res
 test("more failed calls than vouchers kept: never below the served calls, and the highest voucher is kept", async () => {
   const store = createMemoryStore();
   const gate = channelGate(store);
-  const vs = await Promise.all(Array.from({ length: 40 }, (_, i) => voucher((i + 1) * 10000)));
+  const vs = await Promise.all(Array.from({ length: 80 }, (_, i) => voucher((i + 1) * 10000)));
   const calls = [];
   for (const v of vs) calls.push(await pending(gate, v));
   for (const [i, call] of calls.entries()) await call(i % 2 ? 200 : 500);
   const rec = await store.get(KEY);
-  assert.equal(rec.used, "200000");
-  assert.ok(BigInt(rec.cumulativeAmount) >= 200000n);
-  assert.equal(rec.held.at(-1)[0], "400000");
-  assert.ok(rec.held.length <= 16);
+  assert.equal(rec.used, "400000");
+  assert.ok(BigInt(rec.cumulativeAmount) >= 400000n);
+  assert.equal(rec.held.at(-1)[0], "800000");
+  assert.ok(rec.held.length <= 64 + 4);
 });
 
 test("a record written by 0.2.0 keeps its voucher and goes on from it", async () => {
@@ -192,9 +259,9 @@ test("close: a claim of a process that died stops blocking after an hour, with t
   await useVoucher(gate, await voucher(10000));
   const rec = await store.get(KEY);
   const v2 = await voucher(20000);
-  await store.set(KEY, { ...rec, closing: { at: Date.now() - HOUR + 5000, id: "dead" } });
+  await store.set(KEY, { ...rec, closing: { v: 2, phase: "claimed", at: Date.now() - HOUR + 5000, id: "dead" } });
   assert.equal((await useVoucher(gate, v2)).status, 402);
-  await store.set(KEY, { ...rec, closing: { at: Date.now() - HOUR, id: "dead" } });
+  await store.set(KEY, { ...rec, closing: { v: 2, phase: "claimed", at: Date.now() - HOUR, id: "dead" } });
   assert.equal((await useVoucher(gate, v2)).status, 200);
   assert.deepEqual(await settleWith(store), [[20000n, sigOf(v2)]]);
 });
@@ -273,7 +340,8 @@ test("upstream body breaks off: 502, nothing delivered, the use is given back (v
   const exact = monthlyGate(createMemoryStore(), 5, {
     fetch: async (url) => (paths.push(new URL(url).pathname), new Response(JSON.stringify({ isValid: true, success: true }))),
   });
-  res = await call(exact, { "payment-signature": Buffer.from("{}").toString("base64") }, async () => breaking());
+  const pay = { payload: { authorization: { from: A("4"), nonce: `0x${"1".repeat(64)}` } } };
+  res = await call(exact, { "payment-signature": Buffer.from(JSON.stringify(pay)).toString("base64") }, async () => breaking());
   assert.equal(res.status, 502);
   assert.deepEqual(paths, ["/verify"]); // not settled
 });
@@ -286,4 +354,16 @@ test("a 204 reply is served and counted once", async () => {
   const token = (await purchase(monthlyGate(createMemoryStore(), 5))).headers.get("hub-subscription");
   assert.ok(token);
   assert.equal((await useToken(monthlyGate(createMemoryStore(), 5), token)).status, 200);
+});
+
+test("out of order under many running calls: the close is exact", async () => {
+  const store = createMemoryStore();
+  const gate = channelGate(store);
+  const vs = await Promise.all(Array.from({ length: 40 }, (_, i) => voucher((i + 1) * 10000)));
+  const calls = [];
+  for (let i = 1; i < 40; i += 2) calls.push(await pending(gate, vs[i])); // every second one, 20 running
+  for (let i = 0; i < 40; i += 2) await useVoucher(gate, vs[i], 402); // the others come late and are not served
+  for (const [i, call] of calls.entries()) await call(i % 3 ? 200 : 500);
+  const rec = await store.get(KEY);
+  assert.equal(rec.cumulativeAmount, rec.used);
 });

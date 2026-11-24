@@ -12,7 +12,9 @@ const USDC = "0x5425890298aed601595a70AB815c96711a31Bc65";
 const SECRET = "test-subscription-secret-0123456789";
 const BUYER = A("4");
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
-const monthlyPayment = b64({ accepted: { extra: { plan: "monthly" } }, payload: { authorization: { from: BUYER } } });
+let nonces = 0;
+const authorization = () => ({ from: BUYER, nonce: `0x${(++nonces).toString(16).padStart(64, "0")}` });
+const monthlyPayment = () => b64({ accepted: { extra: { plan: "monthly" } }, payload: { authorization: authorization() } });
 
 function setup({ quota = 2, now = () => 1_000_000, plan } = {}) {
   const calls = [];
@@ -38,7 +40,7 @@ function setup({ quota = 2, now = () => 1_000_000, plan } = {}) {
 }
 const ok = async () => new Response(JSON.stringify({ echo: "hi" }), { headers: { "content-type": "application/json" } });
 const withToken = (t, url = "https://api.example/echo") => new Request(url, { headers: { "hub-subscription": t } });
-const purchase = (gate, next = ok) => gate(new Request("https://api.example/echo", { headers: { "payment-signature": monthlyPayment } }), next);
+const purchase = (gate, next = ok) => gate(new Request("https://api.example/echo", { headers: { "payment-signature": monthlyPayment() } }), next);
 
 test("402 quote carries the monthly exact entry with the exact shape", async () => {
   const { gate } = setup({ quota: null });
@@ -61,13 +63,14 @@ test("monthly purchase settles at the monthly price and returns a spec-shaped to
   const token = res.headers.get("hub-subscription");
   const [part, sig] = token.split(".");
   const payload = JSON.parse(Buffer.from(part, "base64url").toString());
-  assert.deepEqual(payload, { v: 1, seller: A("3"), buyer: BUYER, resource: "https://api.example", network: "eip155:43113", expiresAt: 1_000_000 + 30 * 86400, quota: 2 });
+  assert.deepEqual(payload, { v: 2, seller: A("3"), buyer: BUYER, resource: "https://api.example", path: "/echo", price: "5000000", network: "eip155:43113", expiresAt: 1_000_000 + 30 * 86400, quota: 2, payment: payload.payment });
+  assert.match(payload.payment, /^[0-9a-f]{32}$/);
   assert.equal(sig, createHmac("sha256", SECRET).update(part).digest("base64url"));
 });
 
 test("a plain per-call payment is unaffected when monthly is on", async () => {
   const { gate, calls } = setup();
-  const res = await gate(new Request("https://api.example/echo", { headers: { "payment-signature": b64({ payload: {} }) } }), ok);
+  const res = await gate(new Request("https://api.example/echo", { headers: { "payment-signature": b64({ payload: { authorization: authorization() } }) } }), ok);
   assert.equal(res.status, 200);
   assert.equal(calls[0][1], "10000");
   assert.equal(res.headers.get("hub-subscription"), null);
@@ -177,7 +180,7 @@ test("token for another API origin is refused", async () => {
       fetch: async (url) => new Response(JSON.stringify(new URL(url).pathname === "/verify" ? { isValid: true } : { success: true })),
     });
   const a = mk("https://one.example/echo");
-  const token = (await a(new Request("https://one.example/echo", { headers: { "payment-signature": monthlyPayment } }), ok)).headers.get("hub-subscription");
+  const token = (await a(new Request("https://one.example/echo", { headers: { "payment-signature": monthlyPayment() } }), ok)).headers.get("hub-subscription");
   const b = mk("https://two.example/echo");
   const res = await b(withToken(token, "https://two.example/echo"), ok);
   assert.equal(res.status, 402);

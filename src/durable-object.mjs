@@ -1,21 +1,33 @@
 // Cloudflare Workers store. Import only in a Worker (needs "cloudflare:workers").
 // One Durable Object per key: it handles one request at a time, so compareAndSet is one step for every Worker instance.
 import { DurableObject } from "cloudflare:workers";
-import { sameJson } from "./store.mjs";
+import { isExpired, sameJson } from "./store.mjs";
 
 export class SellerKitStore extends DurableObject {
   async get() {
     return (await this.ctx.storage.get("value")) ?? null;
   }
 
+  async #put(storage, value) {
+    await storage.put("value", value);
+    // payment records run out
+    if (typeof value?.expiresAt === "number") await this.ctx.storage.setAlarm((value.expiresAt + 60) * 1000);
+  }
+
+  async alarm() {
+    const value = await this.ctx.storage.get("value");
+    if (isExpired("payment:", value)) await this.ctx.storage.deleteAll();
+    else if (typeof value?.expiresAt === "number") await this.ctx.storage.setAlarm((value.expiresAt + 60) * 1000);
+  }
+
   async set(value) {
-    await this.ctx.storage.put("value", value);
+    await this.#put(this.ctx.storage, value);
   }
 
   async compareAndSet(expected, next) {
     return this.ctx.storage.transaction(async (txn) => {
       if (!sameJson((await txn.get("value")) ?? null, expected)) return false;
-      await txn.put("value", next);
+      await this.#put(txn, next);
       return true;
     });
   }

@@ -11,12 +11,14 @@ const sigOf = (v) => JSON.parse(Buffer.from(v, "base64").toString()).signature.t
 const LEGACY = `channel:${CHANNEL_ID}`;
 const at = (contract, chainId = 43113) => `channel:${chainId}:${contract}:${CHANNEL_ID}`;
 const v = (amount, contract, chainId = 43113) => voucher(amount, CHANNEL_ID, { contract, chainId });
+const closedOn = new WeakMap();
 async function close(store, contract, extra = {}) {
   const sent = [];
+  const done = closedOn.get(store) ?? closedOn.set(store, new Set()).get(store);
   const out = await closeChannels({
     store, chainId: 43113, channelContract: contract, seller: A("3"),
-    readChannel: async () => ({ buyer: BUYER, seller: A("3"), status: 1, deposit: 1_000_000n }),
-    sendClose: async (id, amount, signature) => (sent.push([amount, signature]), "0xtx"), ...extra,
+    readChannel: async () => ({ buyer: BUYER, seller: A("3"), status: done.has(contract) ? 2 : 1, deposit: 1_000_000n }),
+    sendClose: async (id, amount, signature) => (sent.push([amount, signature]), done.add(contract), "0xtx"), ...extra,
   });
   return { ...out, sent };
 }
@@ -53,6 +55,7 @@ test("a V1 record of 0.2.0: V2 starts at zero, V1 stays closable, the old record
   for (const extra of [{}, { closed: true, closeTx: "0x1" }]) {
     const store = await legacyStore(30000, V1, extra);
     const before = await store.get(LEGACY);
+    if (extra.closed) closedOn.set(store, new Set([V1])); // closed on chain, as the record says
     const two = channelGate(store, { contract: V2 });
     assert.equal(await code(await useVoucher(two, await v(10000, V2))), 200);
     assert.equal(await code(await useVoucher(two, await v(10000, V2))), "voucher_not_increasing");
@@ -88,7 +91,8 @@ test("an old record of a contract nobody named: no new credit; naming it as earl
   const store = await legacyStore(30000, A("7"));
   assert.equal(await code(await useVoucher(channelGate(store, { contract: V2 }), await v(10000, V2))), "channel_record_unknown");
   // going back to V1 on a store whose record was last written for V2
-  assert.equal(await code(await useVoucher(channelGate(await legacyStore(30000, V2), { contract: V1 }), await v(10000, V1))), "channel_record_unknown");
+  assert.equal(await code(await useVoucher(channelGate(await legacyStore(30000, V2), { contract: V1 }), await v(10000, V1))), "channel_record_mixed");
+  assert.deepEqual((await close(await legacyStore(30000, V2), V1)).skipped, [{ channelId: CHANNEL_ID, reason: "mixed_record" }]);
   const named = channelGate(store, { contract: V2, prepaid: { earlierContracts: [`eip155:43113/${A("7")}`] } });
   assert.equal(await code(await useVoucher(named, await v(10000, V2))), 200);
   const r = await close(await legacyStore(30000, A("7")), V2);
