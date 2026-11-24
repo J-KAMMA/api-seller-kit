@@ -1,11 +1,12 @@
 // 見本の売り手の窓口（Cloudflare Worker、Avalanche Fuji テスト網のみ）。GET /echo?text=… を x402 の門の後ろに置く。
 // 1回ごと（0.01 USDC）と月額（0.05 USDC・30日・5回まで）。前払いは締めに売り手の鍵が要るので、この見本では出さない。
-// 月額の回数は Worker の記憶の中だけで数える（見本なので、入れ替わると数え直しになる）。
+// 月額の回数は Durable Object に置く（どの実体から呼ばれても同じ数を数える）。
 import { createX402Gate } from "../../src/index.mjs";
-import { createMemoryStore } from "../../src/store.mjs";
+import { createDurableObjectStore } from "../../src/durable-object.mjs";
+
+export { SellerKitStore } from "../../src/durable-object.mjs";
 
 const FUJI_USDC = "0x5425890298aed601595a70ab815c96711a31bc65";
-const store = createMemoryStore();
 let gate = null;
 
 function gateFor(env, origin) {
@@ -21,7 +22,7 @@ function gateFor(env, origin) {
     description: "echo (Hub API market sample, testnet)",
     resource: `${origin}/echo`,
     monthly: env.SUBSCRIPTION_SECRET ? { priceAtomic: env.MONTHLY_PRICE_ATOMIC ?? "50000", quota: Number(env.MONTHLY_QUOTA ?? 5), subscriptionSecret: env.SUBSCRIPTION_SECRET } : undefined,
-    store,
+    store: env.SUBSCRIPTION_SECRET ? createDurableObjectStore(env.SELLER_STORE) : undefined,
     // 同じアカウントの Worker どうしは workers.dev で呼べないので、サービス バインディングで呼ぶ（宛先の住所は公開のまま＝合言葉なしの道）。
     fetch: env.FACILITATOR ? (input, init) => env.FACILITATOR.fetch(new Request(input, init)) : undefined,
   });

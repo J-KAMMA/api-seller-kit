@@ -61,6 +61,33 @@ Collect your earnings with your own key; you pay the gas:
 SELLER_PRIVATE_KEY=… RPC_URL=… CHANNEL_CONTRACT=… NETWORK=eip155:43113 STORE_PATH=./seller-store.json npx api-seller-close --dry-run
 ```
 
+## Store
+
+Prepaid vouchers and monthly quotas are counted in a store. It needs three methods:
+
+| Method | |
+|---|---|
+| `get(key)` | the JSON value, or `null` |
+| `set(key, value)` | writes it |
+| `compareAndSet(key, expected, next)` | writes `next` only if the stored value equals `expected` (`null` = absent), in one step. Returns `true` or `false` |
+
+Pick one that all your instances share:
+
+- **Node, one machine**: the default file store (`storePath`). Several processes may share the file. Use a local disk, not a network share.
+- **Workers**: `createDurableObjectStore` from `@jkamma/api-seller-kit/durable-object` (see `examples/worker/`). Workers KV cannot be used: it has no compare-and-set.
+- **Several machines**: your own store on a database. In SQL: `UPDATE … SET value = :next WHERE key = :key AND value = :expected`, and `INSERT … ON CONFLICT DO NOTHING` when `expected` is `null`. Return whether one row changed, and compare values whatever their key order.
+- **Tests**: `createMemoryStore()` lives in one process only.
+
+Prepaid, and monthly with a quota, refuse to start with a store that has no `compareAndSet`. If exactly one process uses your store, you can pass `singleInstance: true` instead.
+
+If the store cannot be reached, or the file lock is not free within 10 seconds, the call is answered with 502 and not served. A lock left by a stopped process on the same machine is removed automatically; after moving the file to another machine, delete `<storePath>.lock` yourself.
+
+### Upgrading from 0.1
+
+- Default file store: nothing to change. Stop all 0.1 processes before starting 0.2 on the same file.
+- Your own store: add `compareAndSet`, or pass `singleInstance: true`.
+- Worker example: add the `SELLER_STORE` binding and the migration from `examples/worker/wrangler.jsonc`.
+
 ## Examples
 
 - `examples/node-server.mjs`: a Node server.

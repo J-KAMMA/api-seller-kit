@@ -5,6 +5,8 @@
   "main": "worker.mjs",
   "compatibility_date": "2026-07-22",
   "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "name": "SELLER_STORE", "class_name": "SellerKitStore" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SellerKitStore"] }],
   "vars": {
     "SELLER": "0xYOUR_ADDRESS",
     "PAY_TO": "0xYOUR_SPLITTER_FROM_HUB_LISTING",

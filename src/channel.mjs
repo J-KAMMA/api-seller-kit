@@ -1,6 +1,7 @@
-// Prepaid channel vouchers (ApiPaymentChannelV1). Loaded lazily by the gate; needs `viem`.
+// Prepaid channel vouchers (ApiPaymentChannelV1 / V2: same ABI and voucher). Loaded lazily by the gate; needs `viem`.
 // Nothing the buyer sends is trusted for deposit / buyer / seller: all of it is read from the chain.
 import { decodeFunctionResult, encodeFunctionData, recoverTypedDataAddress } from "viem";
+import { casUpdate, sameJson } from "./store.mjs";
 
 export const CHANNEL_ABI = [
   {
@@ -90,7 +91,7 @@ export async function readChannelViaRpc({ rpcUrl, channelContract, channelId, do
  * @param {{ network: string, asset: string, seller: string, resource?: string,
  *           prepaid: { pricePerCallAtomic: string|number|bigint, channelContract: string, minDepositAtomic?: string,
  *                      rpcUrl?: string, readChannel?: (channelId: string) => Promise<object> },
- *           store: { get(k:string):any, set(k:string,v:any):any }, doFetch?: typeof fetch }} o
+ *           store: { get(k:string):any, compareAndSet(k:string,expected:any,next:any):any }, doFetch?: typeof fetch }} o
  */
 export function createChannelHandler(o) {
   const { prepaid, store } = o;
@@ -100,16 +101,6 @@ export function createChannelHandler(o) {
   const seller = o.seller.toLowerCase();
   const asset = o.asset.toLowerCase();
   const read = prepaid.readChannel ?? ((channelId) => readChannelViaRpc({ rpcUrl: prepaid.rpcUrl, channelContract: contract, channelId, doFetch: o.doFetch }));
-  const locks = new Map();
-
-  function withLock(key, fn) {
-    const run = (locks.get(key) ?? Promise.resolve()).then(fn, fn);
-    const tail = run.catch(() => {});
-    locks.set(key, tail);
-    tail.then(() => locks.get(key) === tail && locks.delete(key));
-    return run;
-  }
-
   const reject = (error) => ({ ok: false, status: 402, error });
 
   /** @returns {Promise<{ok:true, receipt:string, rollback:()=>Promise<void>}|{ok:false, status:number, error:string}>} */
@@ -158,31 +149,33 @@ export function createChannelHandler(o) {
 
     const key = `channel:${channelId}`;
     const signature = v.signature.toLowerCase();
-    return withLock(key, async () => {
-      const prev = await store.get(key);
-      const highest = prev && typeof prev.cumulativeAmount === "string" && /^\d+$/.test(prev.cumulativeAmount) ? BigInt(prev.cumulativeAmount) : 0n;
-      if (cumulative - highest < price) return reject("voucher_not_increasing");
-      // Persist the highest voucher BEFORE the upstream call so a crash never loses a promise we served.
-      await store.set(key, { cumulativeAmount: cumulative.toString(), signature, deposit: deposit.toString() });
-      await withLock("index", async () => {
-        const index = await store.get("channels");
-        const list = Array.isArray(index) ? index : [];
-        if (!list.includes(channelId)) await store.set("channels", [...list, channelId]);
-      });
-      const receipt = utf8ToBase64(
-        JSON.stringify({ channelId, cumulativeAmount: cumulative.toString(), remainingAtomic: (deposit - cumulative).toString() }),
-      );
-      return {
-        ok: true,
-        receipt,
-        rollback: () =>
-          withLock(key, async () => {
-            const cur = await store.get(key);
-            if (cur?.signature !== signature) return; // a later voucher already replaced ours: it covers ours
-            await store.set(key, prev ?? { cumulativeAmount: "0", signature: null });
-          }),
-      };
+    // Persist the highest voucher BEFORE the upstream call so a crash never loses a promise we served.
+    const record = { cumulativeAmount: cumulative.toString(), signature, deposit: deposit.toString() };
+    const taken = await casUpdate(store, key, (prev) => {
+      if (prev !== null && !/^[0-9]+$/.test(prev.cumulativeAmount)) throw new Error("stored_voucher_malformed"); // fail closed
+      if (prev?.closed) return { result: { ok: false, error: "channel_not_open" } };
+      if (cumulative - BigInt(prev?.cumulativeAmount ?? 0) < price) return { result: { ok: false, error: "voucher_not_increasing" } };
+      return { next: record, result: { ok: true, prev } };
     });
+    if (!taken.ok) return reject(taken.error);
+
+    /** Puts the previous record back only while ours is still the stored one: a value anyone wrote after ours stays. */
+    const rollback = () =>
+      casUpdate(store, key, (cur) => (sameJson(cur, record) ? { next: taken.prev ?? { cumulativeAmount: "0", signature: null } } : {}));
+
+    try {
+      await casUpdate(store, "channels", (index) => {
+        const list = Array.isArray(index) ? index : [];
+        return list.includes(channelId) ? {} : { next: [...list, channelId] };
+      });
+    } catch (e) {
+      await rollback().catch(() => {});
+      throw e;
+    }
+    const receipt = utf8ToBase64(
+      JSON.stringify({ channelId, cumulativeAmount: cumulative.toString(), remainingAtomic: (deposit - cumulative).toString() }),
+    );
+    return { ok: true, receipt, rollback };
   }
 
   return { accept };

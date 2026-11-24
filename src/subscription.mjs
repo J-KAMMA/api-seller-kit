@@ -1,6 +1,8 @@
 // Monthly subscription token (HMAC-SHA256) and quota counter. Token format (PREPAID-MONTHLY.md):
 //   base64url(JSON {v:1, seller, buyer, resource, network, expiresAt, quota}) + "." + base64url(HMAC(secret, payloadPart))
 
+import { casUpdate } from "./store.mjs";
+
 export const PERIOD_DAYS = 30;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
@@ -58,37 +60,42 @@ export async function verifyToken(secret, token) {
 
 /**
  * @param {{ seller: string, network: string, monthly: { quota: number|null, subscriptionSecret: string },
- *           store: { get(k:string):any, set(k:string,v:any):any }, now?: () => number, resourceOrigin: (request: Request) => string }} o
+ *           store: { get(k:string):any, compareAndSet(k:string,expected:any,next:any):any }, now?: () => number, resourceOrigin: (request: Request) => string }} o
  */
 export function createSubscriptions(o) {
   const { monthly, store } = o;
   const now = o.now ?? (() => Math.floor(Date.now() / 1000));
   const seller = o.seller.toLowerCase();
-  const locks = new Map();
-
-  function withLock(key, fn) {
-    const run = (locks.get(key) ?? Promise.resolve()).then(fn, fn);
-    const tail = run.catch(() => {});
-    locks.set(key, tail);
-    tail.then(() => locks.get(key) === tail && locks.delete(key));
-    return run;
+  /** A counter we cannot read must not count as zero. */
+  function used(rec) {
+    if (rec === null) return 0;
+    if (!Number.isInteger(rec.count) || rec.count < 0) throw new Error("stored_quota_malformed");
+    return rec.count;
   }
 
   return {
     /** Issue a token after a settled monthly payment. `buyer` is the EIP-3009 `from`. */
     async issue(buyer, request) {
-      const payload = {
-        v: 1,
-        seller,
-        buyer: String(buyer).toLowerCase(),
-        resource: o.resourceOrigin(request),
-        network: o.network,
-        expiresAt: now() + PERIOD_DAYS * 86400,
-        quota: monthly.quota ?? null,
-      };
-      const token = await signToken(monthly.subscriptionSecret, payload);
-      await store.set(`quota:${token.split(".")[1]}`, { count: 1 }); // the purchasing call is the first use
-      return token;
+      // The token is fully determined by its fields, so two purchases by one buyer in the same second would share a token and a counter.
+      // Claim the counter with compare-and-set; when it is taken, move to the next second to get a token of its own.
+      for (let extra = 0; extra < 60; extra++) {
+        const payload = {
+          v: 1,
+          seller,
+          buyer: String(buyer).toLowerCase(),
+          resource: o.resourceOrigin(request),
+          network: o.network,
+          expiresAt: now() + PERIOD_DAYS * 86400 + extra,
+          quota: monthly.quota ?? null,
+        };
+        const token = await signToken(monthly.subscriptionSecret, payload);
+        // the purchasing call is the first use
+        const claimed = await casUpdate(store, `quota:${token.split(".")[1]}`, (rec) =>
+          rec === null ? { next: { count: 1 }, result: true } : { result: false },
+        );
+        if (claimed) return token;
+      }
+      throw new Error("token_unavailable");
     },
 
     /** @returns {Promise<{ok:true, rollback:()=>Promise<void>}|{ok:false, error:string}>} */
@@ -103,19 +110,16 @@ export function createSubscriptions(o) {
       if (!(p.quota === null || (Number.isInteger(p.quota) && p.quota > 0))) return { ok: false, error: "subscription_invalid" };
       // the signed quota is the authority; the counter lives in the store
       const key = `quota:${v.signature}`;
-      return withLock(key, async () => {
-        const rec = await store.get(key);
-        const count = Number.isInteger(rec?.count) && rec.count >= 0 ? rec.count : 0;
-        if (p.quota !== null && count >= p.quota) return { ok: false, error: "subscription_quota_exceeded" };
-        await store.set(key, { count: count + 1 });
+      return casUpdate(store, key, (rec) => {
+        const count = used(rec);
+        if (p.quota !== null && count >= p.quota) return { result: { ok: false, error: "subscription_quota_exceeded" } };
         return {
-          ok: true,
-          rollback: () =>
-            withLock(key, async () => {
-              const cur = await store.get(key);
-              const c = Number.isInteger(cur?.count) ? cur.count : 0;
-              if (c > 0) await store.set(key, { count: c - 1 });
-            }),
+          next: { count: count + 1 },
+          result: {
+            ok: true,
+            // gives back this one use, on top of whatever the others counted meanwhile
+            rollback: () => casUpdate(store, key, (cur) => (used(cur) > 0 ? { next: { count: used(cur) - 1 } } : {})),
+          },
         };
       });
     },

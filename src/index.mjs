@@ -3,7 +3,7 @@
 // Fail closed: any verify/settle problem means the body is never returned. The payment payload is never logged.
 // Optional modes (PREPAID-MONTHLY.md): `prepaid` (hub-channel voucher) and `monthly` (hub-subscription token).
 import { createSubscriptions } from "./subscription.mjs";
-import { createFileStore } from "./store.mjs";
+import { createFileStore, isAtomicStore, singleInstanceStore } from "./store.mjs";
 
 /** @typedef {{
  *   network: string, asset: string, payTo: string, seller: string, priceAtomic: string|number|bigint,
@@ -13,7 +13,8 @@ import { createFileStore } from "./store.mjs";
  *   allowLocalDevNetwork?: boolean,
  *   prepaid?: { pricePerCallAtomic: string|number|bigint, channelContract: string, minDepositAtomic?: string|number|bigint, rpcUrl?: string, readChannel?: Function },
  *   monthly?: { priceAtomic: string|number|bigint, quota: number|null, subscriptionSecret: string },
- *   store?: { get(key: string): any, set(key: string, value: any): any }, storePath?: string, now?: () => number
+ *   store?: { get(key: string): any, set(key: string, value: any): any, compareAndSet?(key: string, expected: any, next: any): any },
+ *   singleInstance?: boolean, storePath?: string, now?: () => number
  * }} GateConfig */
 
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -99,7 +100,18 @@ export function createX402Gate(config) {
   const base = config.facilitatorUrl.replace(/\/+$/, "");
   const price = String(config.priceAtomic);
   const timeout = config.maxTimeoutSeconds ?? 300;
-  const store = config.prepaid || config.monthly ? (config.store ?? createFileStore(config.storePath ?? "./seller-kit-store.json")) : null;
+  let store = null;
+  if (config.prepaid || config.monthly) {
+    store = config.store ?? createFileStore(config.storePath ?? "./seller-kit-store.json");
+    const counts = config.prepaid !== undefined || config.monthly.quota !== null;
+    if (counts && !isAtomicStore(store) && config.singleInstance !== true) {
+      throw new Error(
+        "x402 gate config: prepaid and monthly with a quota need a store with compareAndSet(key, expected, next); " +
+          "pass singleInstance: true only when exactly one process uses this store",
+      );
+    }
+    store = singleInstanceStore(store);
+  }
   const resourceOrigin = (request) => {
     try {
       return new URL(config.resource ?? request.url).origin;
@@ -201,7 +213,8 @@ export function createX402Gate(config) {
   }
 
   /** Serve an already-authorised call (subscription or voucher): roll the counter back when upstream fails. */
-  async function serveAuthorised(request, next, rollback, extraHeaders) {
+  async function serveAuthorised(request, next, undo, extraHeaders) {
+    const rollback = () => undo().catch(() => {}); // a store failure here keeps the use counted; the reply stays the upstream error
     let upstream;
     try {
       upstream = await next(request);
