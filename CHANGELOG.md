@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 (2026-11-25)
+
+- Monthly always has an RPC to look up an unclear payment: a public one by default on Fuji and Base Sepolia.
+- Overlapping requests of one buyer with the same payment answer `payment_in_progress`.
+- Worker example: chain lookups no longer go to the facilitator binding.
+
 ## 0.3.0 (2026-11-25)
 
 Upgrade gates and `api-seller-close` together.

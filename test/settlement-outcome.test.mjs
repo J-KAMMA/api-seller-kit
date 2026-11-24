@@ -95,7 +95,8 @@ test("this facilitator answers a settled payment with a failure: with an RPC the
     assert.deepEqual([...(await told(again)), (await again.json()).error, again.headers.get("hub-subscription")], [409, "settled", "already_served", first.headers.get("hub-subscription")]);
     assert.deepEqual([w.calls, w.settles], [1, 1]);
 
-    w = world({ monthly, proof: false });
+    if (monthly) continue; // monthly always has an RPC
+    w = world({ proof: false });
     for (let i = 0; i < 3; i++) assert.deepEqual(await told(await w.go()), [409, "unclear"]);
     assert.equal(w.calls, 1);
     assert.deepEqual(await told(await w.go({})), [409, "unclear"]);
@@ -425,12 +426,12 @@ test("the table: every first answer", () => {
     ok: [A_({ success: true }), A_({ success: true, transaction: "0x1" })],
     contested: [
       A_({ success: true, extensions: { "hub-settlement": { replayed: true } } }), A_({ success: false, extensions: { "hub-settlement": { replayed: true } } }),
-      A_({ success: false, errorReason: "duplicate_settlement" }), A_({ success: false, errorReason: "duplicate_settlement" }, 409),
+      A_({ success: false, errorReason: "duplicate_settlement", transaction: "", network: "eip155:43113" }), A_({ success: false, errorReason: "duplicate_settlement" }), A_({ success: false, errorReason: "duplicate_settlement" }, 409),
       A_({ success: false, errorReason: "invalid_exact_evm_nonce_already_used" }), A_({ success: false, errorReason: "nonce_already_used" }, 400),
     ],
-    refused: [A_({ success: false, errorReason: "rate_limited" }, 429), A_(null, 401), A_({}, 403), A_({}, 400), A_({ success: true }, 403), A_({ success: false, errorReason: "invalid_exact_evm_transaction_simulation_failed", transaction: "" }), A_({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" })],
+    refused: [A_({ success: false, errorReason: "rate_limited" }, 429), A_({ success: false, errorReason: "settlement_unavailable", transaction: "" }, 424), A_({ success: false, errorReason: "facilitator_gas_low" }, 424), A_(null, 401), A_({}, 403), A_({}, 400), A_({ success: true }, 403), A_({ success: false, errorReason: "invalid_exact_evm_transaction_simulation_failed", transaction: "" }), A_({ success: false, errorReason: "invalid_exact_evm_insufficient_balance" })],
     ambiguous: [
-      A_(null, 408), A_({}, 409), A_(null, 425), A_(null, 499), A_(null, 0), A_(null, 302), A_({}, 503), A_({ success: true }, 500), A_(null), A_([]), A_("x"), A_({}), A_({ success: "true" }), A_({ success: false }), A_({ success: false, errorReason: "settlement_pending" }),
+      A_(null, 408), A_({}, 409), A_(null, 425), A_(null, 499), A_(null, 0), A_(null, 302), A_({}, 503), A_({ success: true }, 500), A_(null), A_([]), A_("x"), A_({}), A_({ success: "true" }), A_({ success: false }), A_({ success: false, errorReason: "settlement_pending" }), A_({ success: false, errorReason: "settlement_unavailable", transaction: "" }, 503),
       A_({ success: false, errorReason: "invalid_exact_evm_transaction_failed" }), A_({ success: false, errorReason: "something_new" }), A_({ success: false, errorReason: "invalid_x", transaction: "0x1" }), A_({ success: false, transaction: "0x1" }, 429),
     ],
   };
@@ -576,5 +577,107 @@ test("one attempt ends before its lease, whatever hangs", async () => {
     assert.equal((await p.look({ from: FROM, nonce: NONCE, amount: "1", validBefore: null, startBlock: "1", claimedAt: 5, until: Date.now() })).state, "unclear");
   } finally {
     Date.now = real;
+  }
+});
+
+test("the facilitator refuses before it reserved anything (424), or knows of an attempt with an unknown outcome (duplicate)", async () => {
+  let w = world();
+  w.answer = () => Response.json({ success: false, errorReason: "facilitator_gas_low", transaction: "", network: "eip155:43113" }, { status: 424 });
+  assert.deepEqual(await told(await w.go()), [409, "unclear"]);
+  w.answer = () => ((w.used = true), Response.json({ success: true, transaction: "0xtx" })); // later it works: settled by this very request
+  assert.deepEqual(await told(await w.go()), [200, "settled"]);
+  // our own first attempt timed out, the facilitator does not know its outcome: the chain does
+  w = world({ mode: "lost", reads: false });
+  assert.deepEqual(await told(await w.go()), [409, "unclear"]);
+  w.answer = () => Response.json({ success: false, errorReason: "duplicate_settlement", transaction: "", network: "eip155:43113" });
+  assert.deepEqual(await told(await w.go()), [409, "unclear"]);
+  w.reads = true;
+  assert.deepEqual(await told(await w.go()), [200, "settled"]);
+});
+
+/** Monthly with the kit's defaults: no RPC named. */
+function plainMonthly({ network = "eip155:43113", settle, rpcUrls }) {
+  const asked = [];
+  const gate = createX402Gate({
+    network, asset: USDC, payTo: A("2"), seller: A("3"), priceAtomic: "10000", facilitatorUrl: "https://f.example", resource: "https://api.example/echo", store: createMemoryStore(),
+    monthly: { priceAtomic: "50000", quota: 3, subscriptionSecret: "s".repeat(32) },
+    fetch: async (url, init) => {
+      if (url.endsWith("/verify")) return Response.json({ isValid: true });
+      if (url.endsWith("/settle")) return settle();
+      asked.push(url);
+      return rpcUrls(url, JSON.parse(init.body));
+    },
+  });
+  const go = () => gate(new Request("https://api.example/echo", { headers: { "payment-signature": Buffer.from(JSON.stringify({ accepted: { extra: { plan: "monthly" } }, payload: { authorization: { from: FROM, nonce: NONCE, validBefore: String(T0 + 300) } } })).toString("base64"), ...OWNER } }), async () => Response.json({}));
+  return { go, asked };
+}
+
+test("monthly without a named RPC: an own settlement that timed out is collected although the facilitator says replayed", async () => {
+  for (const [network, id] of [["eip155:43113", "0xa869"], ["eip155:84532", "0x14a34"]]) {
+    let n = 0;
+    let up = false;
+    const rpc = (url, { method, params }) => {
+      if (!up) throw new Error("rpc down");
+      const at = (b) => T0 - 200 + Number(b); // one block a second
+      const result = {
+        eth_chainId: () => id,
+        eth_blockNumber: () => "0xfa",
+        eth_getBlockByNumber: () => ({ timestamp: `0x${at(params[0]).toString(16)}` }),
+        eth_call: () => word("0x1"),
+        eth_getLogs: () => (BigInt(params[0].fromBlock) <= 205n && 205n <= BigInt(params[0].toBlock) ? [{ transactionHash: "0xtx" }] : []),
+        eth_getTransactionReceipt: () => ({ status: "0x1", transactionHash: "0xtx", logs: [
+          { address: USDC, logIndex: "0x1", topics: [USED, word(FROM), NONCE], data: "0x" },
+          { address: USDC, logIndex: "0x2", topics: [TRANSFER, word(FROM), word(A("2"))], data: word("0xc350") },
+        ] }),
+      }[method]();
+      return Response.json({ jsonrpc: "2.0", id: 1, result });
+    };
+    const { go, asked } = plainMonthly({
+      network,
+      rpcUrls: rpc,
+      settle: () => {
+        if (n++ === 0) throw new Error("timed out, but the money moved");
+        return Response.json({ success: true, transaction: "0xtx", extensions: { "hub-settlement": { replayed: true } } });
+      },
+    });
+    assert.deepEqual(await told(await go()), [409, "unclear"]);
+    assert.deepEqual(await told(await go()), [409, "unclear"]); // ambiguous, not contested
+    up = true;
+    const res = await go();
+    assert.deepEqual(await told(res), [200, "settled"]);
+    assert.ok(res.headers.get("hub-subscription"));
+    assert.ok(asked.length > 0);
+  }
+});
+
+test("the default RPC is not asked on the way of a normal payment; other networks need one named for monthly", async () => {
+  const { go, asked } = plainMonthly({ settle: () => Response.json({ success: true, transaction: "0xtx" }), rpcUrls: () => assert.fail("must not be asked") });
+  assert.deepEqual(await told(await go()), [200, "settled"]);
+  assert.deepEqual(asked, []);
+  const base = { asset: "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e", payTo: A("2"), seller: A("3"), priceAtomic: "1", facilitatorUrl: "http://127.0.0.1:1", resource: "https://api.example/echo", store: createMemoryStore(), monthly: { priceAtomic: "1", quota: null, subscriptionSecret: "s".repeat(32) } };
+  for (const o of [{ network: "eip155:31337", allowLocalDevNetwork: true }]) {
+    assert.throws(() => createX402Gate({ ...base, ...o }), /settlementRpcUrl/);
+    assert.doesNotThrow(() => createX402Gate({ ...base, ...o, settlementRpcUrl: "https://rpc.example" }));
+  }
+});
+
+test("the same buyer's two requests overlap: neither is told that the payment is settled or used; a stranger learns no more than before", async () => {
+  for (const [headers, error, state] of [[OWNER, "payment_in_progress", "unclear"], [{}, "payment_already_used", "settled"], [{ "hub-idempotency-key": "x".repeat(32) }, "payment_already_used", "settled"]]) {
+    const w = world({ mode: "ok" });
+    let first;
+    const cas = w.store.compareAndSet;
+    let hooked = false;
+    // the second request is verified, then the first one runs to its end, then the second one tries to claim
+    w.store.compareAndSet = async (key, expected, next) => {
+      if (!hooked && next?.state === "running") {
+        hooked = true;
+        first = await w.go(OWNER);
+      }
+      return cas(key, expected, next);
+    };
+    const res = await w.go(headers);
+    assert.equal(first.status, 200);
+    assert.deepEqual([res.status, res.headers.get("hub-payment-status"), (await res.json()).error], [409, state, error]);
+    assert.equal(w.calls, 1);
   }
 });

@@ -81,7 +81,7 @@ Without the secret the route does not exist. Keep the secret as safe as your key
 
 ## Store
 
-One store per `payTo` address, shared by everything that takes payments for it. One store per seller and contract set, shared by all instances, and never reset while channels are open or tokens are valid: with an empty store, vouchers and tokens already used count as new.
+One store per `payTo` address, shared by everything that takes per-call or monthly payments for it. This is not optional: with two stores, if the first gate's settlement times out although it went through and the second gate's settlement of the same payment is answered with a success, both serve it, and the kit cannot see that. One store per seller and contract set, shared by all instances, and never reset while channels are open or tokens are valid: with an empty store, vouchers and tokens already used count as new.
 
 Prepaid vouchers and monthly quotas are counted in a store. It needs three methods:
 
@@ -143,7 +143,7 @@ Stop all 0.2.0 processes before starting 0.2.1 on the same store. Records are no
   | `settled` | 200, 409, 502 | it was settled; do not pay again. With 502 the reply is still owed: repeat the same request |
   | `refused` | 402, 413, 502 | this request settled nothing; safe to pay unless the same payment was sent before |
 
-- Set `settlementRpcUrl` (an RPC of the same chain; prepaid's `rpcUrl` is used otherwise). With it the gate finds a payment on chain that the facilitator did not confirm, and can tell when an authorization ran out unused. Without it such a payment stays `unclear`.
+- Set `settlementRpcUrl` (an RPC of the same chain; prepaid's `rpcUrl` is used otherwise). Monthly always has one: on Fuji and Base Sepolia a public RPC is the default, asked only when a payment is unclear; elsewhere you must name it. With it the gate finds a payment on chain that the facilitator did not confirm, and can tell when an authorization ran out unused. Without it such a payment stays `unclear`.
 - One payment gets one reply. Several instances must share a store for that, also when you only sell per call; on Workers the gate refuses to start without one. Instances that do not share a store cannot see each other's payments: if two get the same payment at once and the facilitator answers both with a plain success, both serve it.
 - A buyer who sends `hub-idempotency-key` (32 to 200 random characters, new for every payment) can repeat the same request (method, address and body up to 1 MB) after an unclear payment. If it turns out paid, the API is called for that buyer, once more if the first reply was withheld, and the payment is done. A monthly token is given again at any time. Replies are not stored: one that was sent but got lost cannot be fetched again, and neither can a lost prepaid or monthly call. Without the key nothing can be repeated: a payment's signature is public on chain and proves nothing.
 - Only 2xx replies count. A redirect or an error of your API is passed on and costs nothing. Your API gets the request without the payment headers and without conditional ones (`if-none-match` and the like), and must answer within `upstreamTimeoutMs` (5 minutes).

@@ -6,7 +6,7 @@ import { createSubscriptions } from "./subscription.mjs";
 import { ATTEMPT_MS, BodyTooLarge, createPayments, IDEMPOTENCY_HEADER, ownerDigest, paymentId, requestDigest, sha256Hex } from "./payments.mjs";
 import { createSettlementProof } from "./settlement-proof.mjs";
 import { classify, decide, reclassify } from "./settlement-table.mjs";
-import { settledDepth } from "./networks.mjs";
+import { PUBLIC_RPC, settledDepth } from "./networks.mjs";
 import { minDeposit } from "./voucher-record.mjs";
 import { createFileStore, createMemoryStore, isAtomicStore, isProcessLocal, singleInstanceStore } from "./store.mjs";
 
@@ -116,6 +116,7 @@ function assertConfig(c) {
     } catch {
       bad("monthly needs resource: the public address of this API");
     }
+    if (c.settlementRpcUrl === undefined && c.prepaid?.rpcUrl === undefined && !Object.hasOwn(PUBLIC_RPC, c.network)) bad("monthly on this network needs settlementRpcUrl");
     if (!/^https?:$/.test(resource.protocol)) bad("resource must be an http(s) address");
     if (typeof m.subscriptionSecret !== "string" || m.subscriptionSecret.length < 16) bad("monthly.subscriptionSecret must be a string of 16+ characters");
   }
@@ -153,7 +154,10 @@ export function createX402Gate(config) {
     console.warn("x402 gate: payments are remembered by this process only; pass a store with compareAndSet when several instances run, or singleInstance: true");
   }
   const subs = config.monthly ? createSubscriptions({ seller: config.seller, network: config.network, monthly: config.monthly, store, now: config.now, resource: config.resource }) : null;
-  const proofRpc = config.settlementRpcUrl ?? config.prepaid?.rpcUrl;
+  // A month that was paid must be collectable whatever the facilitator answers, so monthly always has an RPC. The public default is asked only
+  // when something is unclear, never on the way of a normal payment.
+  const namedRpc = config.settlementRpcUrl ?? config.prepaid?.rpcUrl;
+  const proofRpc = namedRpc ?? (config.monthly ? PUBLIC_RPC[config.network] : undefined);
   const proof = proofRpc ? createSettlementProof({ rpcUrl: proofRpc, chainId: Number(config.network.split(":")[1]), asset: config.asset, payTo: config.payTo, doFetch, depth: settledDepth(config.network) }) : null;
   const upstreamTimeout = config.upstreamTimeoutMs ?? 300_000;
   const payments = createPayments(store ?? createMemoryStore(), upstreamTimeout);
@@ -509,6 +513,8 @@ export function createX402Gate(config) {
     } catch {
       return failed(502, "store_unavailable", "refused");
     }
+    // The same buyer's other request was faster: it is being served, nothing is decided for this one.
+    if (!claim.rec && owner && claim.existing.owner === owner) return failed(409, "payment_in_progress", "unclear");
     if (!claim.rec) return failed(409, "payment_already_used", ["settled", "owed", "delivering"].includes(claim.existing.state) ? "settled" : "unclear");
     const release = () => payments.release(payment.key, claim.rec.id).catch(() => {}); // nothing was settled
 
@@ -529,7 +535,7 @@ export function createX402Gate(config) {
 
     let startBlock = null;
     try {
-      startBlock = proof ? await proof.startBlock() : null;
+      startBlock = namedRpc ? await proof.startBlock() : null; // without it a search starts at the time of the claim
       if (!(await payments.settling(payment.key, claim.rec.id, startBlock))) return failed(409, "payment_in_progress", "unclear"); // another request took it over after the lease
     } catch {
       await release();
