@@ -46,6 +46,12 @@ export const STATUS_OPEN = 1;
 const RPC_TIMEOUT_MS = 10_000;
 const MAX_VOUCHER_HEADER = 4 * 1024;
 const MAX_UINT256 = (1n << 256n) - 1n;
+const SECP256K1_HALF_N = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
+
+/** The canonical ECDSA form only: 65 bytes, low s, v = 27 or 28. */
+function isCanonicalSignature(signature) {
+  return typeof signature === "string" && /^0x[0-9a-fA-F]{128}1[bBcC]$/.test(signature) && BigInt(`0x${signature.slice(66, 130)}`) <= SECP256K1_HALF_N;
+}
 
 function base64ToUtf8(b64) {
   const bin = atob(b64);
@@ -118,7 +124,7 @@ export function createChannelHandler(o) {
     if (!v || typeof v !== "object" || Array.isArray(v)) return reject("voucher_invalid");
     if (typeof v.channelId !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(v.channelId)) return reject("voucher_invalid");
     if (typeof v.cumulativeAmount !== "string" || !/^(0|[1-9]\d{0,77})$/.test(v.cumulativeAmount)) return reject("voucher_invalid");
-    if (typeof v.signature !== "string" || !/^0x[0-9a-fA-F]{128,132}$/.test(v.signature)) return reject("voucher_invalid");
+    if (!isCanonicalSignature(v.signature)) return reject("voucher_invalid");
     const cumulative = BigInt(v.cumulativeAmount);
     if (cumulative > MAX_UINT256) return reject("voucher_invalid");
     const channelId = v.channelId.toLowerCase();

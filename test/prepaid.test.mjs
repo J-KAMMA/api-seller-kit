@@ -179,6 +179,29 @@ test("per-call exact path is unchanged when prepaid is on (facilitator still ver
   assert.ok(res.headers.get("x-payment-response"));
 });
 
+test("only the canonical signature form is accepted, and a refused voucher is not stored", async () => {
+  const { gate, store } = setup();
+  const good = JSON.parse(Buffer.from(await voucher(10000), "base64").toString());
+  const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+  const r = good.signature.slice(2, 66);
+  const s = good.signature.slice(66, 130);
+  const v = good.signature.slice(130);
+  const highS = (N - BigInt(`0x${s}`)).toString(16).padStart(64, "0");
+  const odd = v === "1b" ? "0" : "1";
+  for (const signature of [
+    `0x${r}${s}0${odd}`,
+    `0x${r}${s}${odd}`,
+    `0x${r}${highS}${v === "1b" ? "1c" : "1b"}`,
+    `0x${r}${s}`,
+    `0x${r}${s}1d`,
+    `0x${r}${s}${v}00`,
+  ]) {
+    await rejected(await gate(req(b64({ ...good, signature })), ok), "voucher_invalid");
+  }
+  assert.equal(await store.get(`channel:${CHANNEL_ID}`) ?? null, null);
+  assert.equal((await gate(req(b64({ ...good, signature: `0x${(r + s + v).toUpperCase()}` })), ok)).status, 200);
+});
+
 test("prepaid config validation", () => {
   const base = { network: "eip155:43113", asset: USDC, payTo: A("2"), seller: SELLER, priceAtomic: "1", facilitatorUrl: "https://f.example" };
   const p = { pricePerCallAtomic: "1", channelContract: CHANNEL, rpcUrl: "https://rpc.example" };
