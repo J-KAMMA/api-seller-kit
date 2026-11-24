@@ -56,7 +56,7 @@ test("memory store, two gates: one voucher is served once", async () => {
   const v = await voucher(10000);
   const rs = await Promise.all(Array.from({ length: 16 }, (_, i) => useVoucher(gates[i % 2], v)));
   assert.equal(served(rs), 1);
-  assert.equal((await store.inner.get(`channel:${CHANNEL_ID}`)).cumulativeAmount, "10000");
+  assert.equal((await store.inner.get(`channel:43113:${A("c")}:${CHANNEL_ID}`)).cumulativeAmount, "10000");
 });
 
 test("memory store, two gates: the monthly quota holds, and the count is exact", async () => {
@@ -83,7 +83,7 @@ test("memory store, two gates: the channel index keeps every channel", async () 
   const ids = Array.from({ length: 10 }, (_, i) => `0x${String(i).repeat(64)}`);
   const rs = await Promise.all(ids.map(async (id, i) => useVoucher(gates[i % 2], await voucher(10000, id))));
   assert.equal(served(rs), 10);
-  assert.deepEqual([...(await store.inner.get("channels"))].sort(), ids);
+  assert.deepEqual([...(await store.inner.get(`channels:43113:${A("c")}`))].sort(), ids);
 });
 
 test("two gates: a rollback never lowers a value the other gate raised", async () => {
@@ -110,7 +110,10 @@ test("two gates: a rollback never lowers a value the other gate raised", async (
   });
   assert.equal(res.status, 500);
   assert.equal(raised, 200);
-  assert.equal((await inner.get(`channel:${CHANNEL_ID}`)).cumulativeAmount, "20000");
+  // one call was served: the other gate's. Its use stays counted, its voucher stays held, and only the failed call was given back.
+  const rec = await inner.get(`channel:43113:${A("c")}:${CHANNEL_ID}`);
+  assert.equal(rec.used, "10000");
+  assert.deepEqual(rec.held.map((h) => h[0]), ["10000", "20000"]);
 });
 
 test("a rollback that finds the store unavailable keeps the upstream reply and the count", async () => {
@@ -145,7 +148,7 @@ test("two purchases in one second get separate tokens and counters; a used count
 test("malformed stored values fail closed", async () => {
   const token = await quotaToken(5);
   assert.equal((await useToken(monthlyGate(createMemoryStore({ [quotaKey(token)]: { count: "x" } }), 5), token)).status, 502);
-  const bad = createMemoryStore({ [`channel:${CHANNEL_ID}`]: { cumulativeAmount: "oops" } });
+  const bad = createMemoryStore({ [`channel:43113:${A("c")}:${CHANNEL_ID}`]: { cumulativeAmount: "oops" } });
   assert.equal((await useVoucher(channelGate(bad), await voucher(10000))).status, 502);
 });
 
@@ -180,21 +183,29 @@ test("a store that always reports a conflict ends in 502, never in a served call
   }
 });
 
-test("close keeps a voucher stored while the transaction was in flight, and a closed channel takes no more calls", async () => {
+test("close refuses vouchers while its transaction is in flight, keeps the stored one, and a closed channel takes no more calls", async () => {
   const store = createMemoryStore();
   const gate = channelGate(store);
   await useVoucher(gate, await voucher(10000));
   const v2 = await voucher(20000);
-  await closeChannels({
+  const out = await closeChannels({
     store,
+    chainId: 43113,
+    channelContract: A("c"),
     seller: A("3"),
     readChannel: async () => ({ seller: A("3"), status: 1, deposit: 1_000_000n }),
-    sendClose: async () => (assert.equal((await useVoucher(gate, v2)).status, 200), "0xtx"),
+    sendClose: async () => {
+      const res = await useVoucher(gate, v2);
+      assert.equal(res.status, 402);
+      assert.equal((await res.json()).error, "channel_closing");
+      return "0xtx";
+    },
   });
-  const rec = await store.get(`channel:${CHANNEL_ID}`);
-  assert.equal(rec.cumulativeAmount, "20000");
+  assert.deepEqual(out.closed, [CHANNEL_ID]);
+  const rec = await store.get(`channel:43113:${A("c")}:${CHANNEL_ID}`);
+  assert.equal(rec.cumulativeAmount, "10000");
   assert.equal(rec.closed, true);
-  assert.equal((await useVoucher(gate, await voucher(30000))).status, 402);
+  assert.equal((await useVoucher(gate, v2)).status, 402);
 });
 
 test("file store, separate processes: one voucher is served once and every channel is indexed", async () => {
@@ -205,8 +216,8 @@ test("file store, separate processes: one voucher is served once and every chann
   assert.equal(total(reports), 1);
   assert.deepEqual(reports.flatMap((r) => r.errors), []);
   const data = JSON.parse(readFileSync(path, "utf8"));
-  assert.equal(data[`channel:${CHANNEL_ID}`].cumulativeAmount, "10000");
-  assert.deepEqual([...data.channels].sort(), [...own, CHANNEL_ID].sort());
+  assert.equal(data[`channel:43113:${A("c")}:${CHANNEL_ID}`].cumulativeAmount, "10000");
+  assert.deepEqual([...data[`channels:43113:${A("c")}`]].sort(), [...own, CHANNEL_ID].sort());
   assert.equal(existsSync(`${path}.lock`), false);
   assert.equal(readdirSync(join(path, "..")).length, 1); // no temp or lock file is left
 });

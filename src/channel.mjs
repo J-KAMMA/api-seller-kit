@@ -1,7 +1,9 @@
 // Prepaid channel vouchers (ApiPaymentChannelV1 / V2: same ABI and voucher). Loaded lazily by the gate; needs `viem`.
 // Nothing the buyer sends is trusted for deposit / buyer / seller: all of it is read from the chain.
 import { decodeFunctionResult, encodeFunctionData, recoverTypedDataAddress } from "viem";
-import { casUpdate, sameJson } from "./store.mjs";
+import { earlierContracts, legacyRecord, VOUCHER_TYPES } from "./legacy.mjs";
+import { casUpdate } from "./store.mjs";
+import { channelKeys, giveBack, isClaimed, recordState, takeUse } from "./voucher-record.mjs";
 
 export const CHANNEL_ABI = [
   {
@@ -36,12 +38,7 @@ export const CHANNEL_ABI = [
   },
 ];
 
-export const VOUCHER_TYPES = {
-  Voucher: [
-    { name: "channelId", type: "bytes32" },
-    { name: "cumulativeAmount", type: "uint256" },
-  ],
-};
+export { VOUCHER_TYPES };
 
 export const STATUS_OPEN = 1;
 const RPC_TIMEOUT_MS = 10_000;
@@ -100,6 +97,8 @@ export function createChannelHandler(o) {
   const price = BigInt(prepaid.pricePerCallAtomic);
   const seller = o.seller.toLowerCase();
   const asset = o.asset.toLowerCase();
+  const keys = channelKeys(chainId, contract);
+  const earlier = earlierContracts(chainId, contract, prepaid.earlierContracts);
   const read = prepaid.readChannel ?? ((channelId) => readChannelViaRpc({ rpcUrl: prepaid.rpcUrl, channelContract: contract, channelId, doFetch: o.doFetch }));
   const reject = (error) => ({ ok: false, status: 402, error });
 
@@ -147,24 +146,30 @@ export function createChannelHandler(o) {
     }
     if (signer.toLowerCase() !== String(ch.buyer).toLowerCase()) return reject("voucher_bad_signature");
 
-    const key = `channel:${channelId}`;
+    const key = keys.record(channelId);
     const signature = v.signature.toLowerCase();
-    // Persist the highest voucher BEFORE the upstream call so a crash never loses a promise we served.
-    const record = { cumulativeAmount: cumulative.toString(), signature, deposit: deposit.toString() };
-    const taken = await casUpdate(store, key, (prev) => {
-      if (prev !== null && !/^[0-9]+$/.test(prev.cumulativeAmount)) throw new Error("stored_voucher_malformed"); // fail closed
-      if (prev?.closed) return { result: { ok: false, error: "channel_not_open" } };
-      if (cumulative - BigInt(prev?.cumulativeAmount ?? 0) < price) return { result: { ok: false, error: "voucher_not_increasing" } };
-      return { next: record, result: { ok: true, prev } };
+    // Count the call and keep the voucher BEFORE the upstream call, so a crash never loses a promise we served.
+    let legacy = null;
+    if (((await store.get(key)) ?? null) === null) {
+      const found = await legacyRecord({ store, chainId, contract, channelId, buyer: ch.buyer, earlier });
+      if (found.unknown) return reject("channel_record_unknown");
+      legacy = found.record;
+    }
+    const taken = await casUpdate(store, key, (stored) => {
+      const prev = stored ?? legacy;
+      const state = recordState(prev); // throws on a record we cannot read: fail closed
+      if (prev?.closed) return { result: "channel_not_open" };
+      if (isClaimed(prev)) return { result: "channel_closing" }; // being closed: what we accept now could not be claimed any more
+      if (cumulative < state.used + price) return { result: "voucher_not_increasing" };
+      return { next: takeUse(prev, price, cumulative, signature, deposit), result: "ok" };
     });
-    if (!taken.ok) return reject(taken.error);
+    if (taken !== "ok") return reject(taken);
 
-    /** Puts the previous record back only while ours is still the stored one: a value anyone wrote after ours stays. */
-    const rollback = () =>
-      casUpdate(store, key, (cur) => (sameJson(cur, record) ? { next: taken.prev ?? { cumulativeAmount: "0", signature: null } } : {}));
+    /** Gives back this one call, on top of whatever other calls did meanwhile. */
+    const rollback = () => casUpdate(store, key, (cur) => ({ next: giveBack(cur, price) }));
 
     try {
-      await casUpdate(store, "channels", (index) => {
+      await casUpdate(store, keys.index, (index) => {
         const list = Array.isArray(index) ? index : [];
         return list.includes(channelId) ? {} : { next: [...list, channelId] };
       });

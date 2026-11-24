@@ -76,12 +76,12 @@ test("valid voucher is served, receipt header is returned, highest is stored", a
   assert.deepEqual(await res.json(), { echo: "hi" });
   const receipt = JSON.parse(Buffer.from(res.headers.get("hub-channel-receipt"), "base64").toString());
   assert.deepEqual(receipt, { channelId: CHANNEL_ID, cumulativeAmount: "10000", remainingAtomic: "990000" });
-  const rec = await store.get(`channel:${CHANNEL_ID}`);
+  const rec = await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`);
   assert.equal(rec.cumulativeAmount, "10000");
-  assert.deepEqual(await store.get("channels"), [CHANNEL_ID]);
+  assert.deepEqual(await store.get(`channels:43113:${CHANNEL}`), [CHANNEL_ID]);
   // next call must go up by at least the price
   assert.equal((await gate(req(await voucher(20000)), ok)).status, 200);
-  assert.equal((await store.get(`channel:${CHANNEL_ID}`)).cumulativeAmount, "20000");
+  assert.equal((await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`)).cumulativeAmount, "20000");
 });
 
 test("rejections: wrong signer, over deposit, not increasing, replay, wrong seller/token, closed, closing, none", async () => {
@@ -125,24 +125,24 @@ test("upstream 500 or throw rolls the stored highest back", async () => {
   const bad = await gate(req(v2), async () => new Response("boom", { status: 500 }));
   assert.equal(bad.status, 500);
   assert.equal(bad.headers.get("hub-channel-receipt"), null);
-  assert.equal((await store.get(`channel:${CHANNEL_ID}`)).cumulativeAmount, "10000");
+  assert.equal((await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`)).cumulativeAmount, "10000");
   const thrown = await gate(req(v2), async () => {
     throw new Error("x");
   });
   assert.equal(thrown.status, 502);
-  assert.equal((await store.get(`channel:${CHANNEL_ID}`)).cumulativeAmount, "10000");
+  assert.equal((await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`)).cumulativeAmount, "10000");
   // the same voucher works once upstream is healthy again
   assert.equal((await gate(req(v2), ok)).status, 200);
-  assert.equal((await store.get(`channel:${CHANNEL_ID}`)).cumulativeAmount, "20000");
+  assert.equal((await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`)).cumulativeAmount, "20000");
 });
 
 test("first voucher failing upstream rolls back to zero and is not closable", async () => {
   const { gate, store } = setup();
   await gate(req(await voucher(10000)), async () => new Response("x", { status: 500 }));
-  const rec = await store.get(`channel:${CHANNEL_ID}`);
+  const rec = await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`);
   assert.equal(rec.cumulativeAmount, "0");
   assert.equal(rec.signature, null);
-  const out = await closeChannels({ store, seller: SELLER, readChannel: async () => ({ seller: SELLER, status: 1, deposit: 1n }), sendClose: async () => "0x" });
+  const out = await closeChannels({ store, chainId: 43113, channelContract: CHANNEL, seller: SELLER, readChannel: async () => ({ buyer: buyer.address, seller: SELLER, status: 1, deposit: 1n }), sendClose: async () => "0x" });
   assert.deepEqual(out.skipped, [{ channelId: CHANNEL_ID, reason: "no_voucher" }]);
 });
 
@@ -198,7 +198,7 @@ test("only the canonical signature form is accepted, and a refused voucher is no
   ]) {
     await rejected(await gate(req(b64({ ...good, signature })), ok), "voucher_invalid");
   }
-  assert.equal(await store.get(`channel:${CHANNEL_ID}`) ?? null, null);
+  assert.equal(await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`) ?? null, null);
   assert.equal((await gate(req(b64({ ...good, signature: `0x${(r + s + v).toUpperCase()}` })), ok)).status, 200);
 });
 
@@ -215,15 +215,15 @@ test("close: dry run lists, real run closes with the highest voucher and marks i
   const { gate, store } = setup();
   await gate(req(await voucher(10000)), ok);
   await gate(req(await voucher(20000)), ok);
-  const readChannel = async () => ({ seller: SELLER, status: 1, deposit: 1_000_000n });
+  const readChannel = async () => ({ buyer: buyer.address, seller: SELLER, status: 1, deposit: 1_000_000n });
   const sent = [];
-  const dry = await closeChannels({ store, seller: SELLER, readChannel, sendClose: async () => assert.fail("dry run must not send"), dryRun: true });
+  const dry = await closeChannels({ store, chainId: 43113, channelContract: CHANNEL, seller: SELLER, readChannel, sendClose: async () => assert.fail("dry run must not send"), dryRun: true });
   assert.deepEqual(dry.wouldClose, [CHANNEL_ID]);
-  const real = await closeChannels({ store, seller: SELLER, readChannel, sendClose: async (id, amt, sig) => (sent.push([id, amt, sig]), "0xtx") });
+  const real = await closeChannels({ store, chainId: 43113, channelContract: CHANNEL, seller: SELLER, readChannel, sendClose: async (id, amt, sig) => (sent.push([id, amt, sig]), "0xtx") });
   assert.deepEqual(real.closed, [CHANNEL_ID]);
   assert.equal(sent[0][1], 20000n);
-  assert.equal(sent[0][2], (await store.get(`channel:${CHANNEL_ID}`)).signature);
-  const again = await closeChannels({ store, seller: SELLER, readChannel, sendClose: async () => assert.fail("already closed") });
+  assert.equal(sent[0][2], (await store.get(`channel:43113:${CHANNEL}:${CHANNEL_ID}`)).signature);
+  const again = await closeChannels({ store, chainId: 43113, channelContract: CHANNEL, seller: SELLER, readChannel, sendClose: async () => assert.fail("already closed") });
   assert.deepEqual(again.skipped, [{ channelId: CHANNEL_ID, reason: "already_closed" }]);
 });
 

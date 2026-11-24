@@ -3,7 +3,7 @@
 //   node bin/close-channels.mjs --dry-run      list what would be closed (no key needed)
 //   SELLER_PRIVATE_KEY=0x... node bin/close-channels.mjs
 // Env: STORE_PATH, RPC_URL, CHANNEL_CONTRACT, NETWORK (eip155:43113), SELLER_PRIVATE_KEY. The key is never printed.
-import { createPublicClient, createWalletClient, defineChain, getAddress, http } from "viem";
+import { createPublicClient, createWalletClient, defineChain, encodeFunctionData, getAddress, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { CHANNEL_ABI } from "../src/channel.mjs";
 import { closeChannels } from "../src/close.mjs";
@@ -46,6 +46,8 @@ const wallet = account ? createWalletClient({ account, chain, transport: http(rp
 
 const result = await closeChannels({
   store,
+  chainId,
+  channelContract,
   seller: sellerAddress,
   dryRun,
   log: (line) => console.log(line),
@@ -54,8 +56,19 @@ const result = await closeChannels({
     return { ...r, status: Number(r.status), deposit: BigInt(r.deposit) };
   },
   sendClose: async (channelId, cumulativeAmount, signature) => {
-    const hash = await wallet.writeContract({ address: channelContract, abi: CHANNEL_ABI, functionName: "close", args: [channelId, cumulativeAmount, signature] });
-    await publicClient.waitForTransactionReceipt({ hash });
+    const notSent = (e) => Object.assign(new Error("close not sent", { cause: e }), { closeNotSent: true });
+    let serialized;
+    try {
+      // everything up to the signature: a failure here means nothing was broadcast
+      const data = encodeFunctionData({ abi: CHANNEL_ABI, functionName: "close", args: [channelId, cumulativeAmount, signature] });
+      const request = await wallet.prepareTransactionRequest({ to: channelContract, data });
+      serialized = await wallet.signTransaction(request);
+    } catch (e) {
+      throw notSent(e);
+    }
+    const hash = await wallet.sendRawTransaction({ serializedTransaction: serialized }); // a failure here may still have reached the network
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== "success") throw notSent(new Error("reverted"));
     return hash;
   },
 });

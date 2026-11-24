@@ -23,23 +23,27 @@ const base = {
   now: () => NOW,
   fetch: async (url) => new Response(JSON.stringify(new URL(url).pathname === "/verify" ? { isValid: true } : { success: true, transaction: "0xabc" })),
 };
-export const channelGate = (store, extra = {}) =>
+export const BUYER = buyer.address;
+export const channelGate = (store, { contract = A("c"), network = base.network, prepaid = {}, ...extra } = {}) =>
   createX402Gate({
     ...base,
+    network,
+    allowedNetworks: [network],
     store,
     prepaid: {
       pricePerCallAtomic: "10000",
-      channelContract: A("c"),
+      channelContract: contract,
       readChannel: async () => ({ buyer: buyer.address, seller: A("3"), token: USDC, deposit: 1_000_000n, closeRequestedAt: 0n, status: 1 }),
+      ...prepaid,
     },
     ...extra,
   });
 export const monthlyGate = (store, quota, extra = {}) =>
   createX402Gate({ ...base, store, monthly: { priceAtomic: "5000000", quota, subscriptionSecret: SECRET }, ...extra });
 
-export async function voucher(cumulative, channelId = CHANNEL_ID) {
+export async function voucher(cumulative, channelId = CHANNEL_ID, { contract = A("c"), chainId = 43113 } = {}) {
   const signature = await buyer.signTypedData({
-    domain: { name: "ApiPaymentChannel", version: "1", chainId: 43113, verifyingContract: A("c") },
+    domain: { name: "ApiPaymentChannel", version: "1", chainId, verifyingContract: contract },
     types: { Voucher: [{ name: "channelId", type: "bytes32" }, { name: "cumulativeAmount", type: "uint256" }] },
     primaryType: "Voucher",
     message: { channelId, cumulativeAmount: BigInt(cumulative) },

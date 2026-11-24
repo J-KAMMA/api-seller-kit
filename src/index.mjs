@@ -11,7 +11,7 @@ import { createFileStore, isAtomicStore, singleInstanceStore } from "./store.mjs
  *   maxTimeoutSeconds?: number, tokenName?: string, tokenVersion?: string,
  *   facilitatorHeaders?: Record<string,string>, fetch?: typeof fetch, allowedNetworks?: string[],
  *   allowLocalDevNetwork?: boolean,
- *   prepaid?: { pricePerCallAtomic: string|number|bigint, channelContract: string, minDepositAtomic?: string|number|bigint, rpcUrl?: string, readChannel?: Function },
+ *   prepaid?: { pricePerCallAtomic: string|number|bigint, channelContract: string, minDepositAtomic?: string|number|bigint, rpcUrl?: string, readChannel?: Function, earlierContracts?: string[] },
  *   monthly?: { priceAtomic: string|number|bigint, quota: number|null, subscriptionSecret: string },
  *   store?: { get(key: string): any, set(key: string, value: any): any, compareAndSet?(key: string, expected: any, next: any): any },
  *   singleInstance?: boolean, storePath?: string, now?: () => number
@@ -51,7 +51,11 @@ function assertConfig(c) {
     throw new Error(`x402 gate config: ${m}`);
   };
   if (!c || typeof c !== "object") bad("config required");
-  const allowed = c.allowedNetworks ?? (c.allowLocalDevNetwork === true ? [...TESTNETS, LOCAL_DEV_NETWORK] : TESTNETS);
+  // Allowlist: every network that can ever be used is named here. `allowedNetworks` only narrows it.
+  const known = [...TESTNETS];
+  if (c.allowLocalDevNetwork === true) known.push(LOCAL_DEV_NETWORK);
+  if (c.allowedNetworks !== undefined && !Array.isArray(c.allowedNetworks)) bad("allowedNetworks must be a list");
+  const allowed = c.allowedNetworks === undefined ? known : known.filter((n) => c.allowedNetworks.includes(n));
   if (!NETWORK.test(c.network) || !allowed.includes(c.network)) bad(`network must be one of ${allowed.join(", ")}`);
   for (const k of ["asset", "payTo", "seller"]) if (!ADDRESS.test(String(c[k]))) bad(`${k} must be a 0x address`);
   if (!/^[1-9]\d{0,29}$/.test(String(c.priceAtomic))) bad("priceAtomic must be a positive integer (atomic units)");
@@ -70,6 +74,9 @@ function assertConfig(c) {
     if (!/^[1-9]\d{0,29}$/.test(String(p.pricePerCallAtomic))) bad("prepaid.pricePerCallAtomic must be a positive integer");
     if (!ADDRESS.test(String(p.channelContract))) bad("prepaid.channelContract must be a 0x address");
     if (p.minDepositAtomic !== undefined && !/^[1-9]\d{0,29}$/.test(String(p.minDepositAtomic))) bad("prepaid.minDepositAtomic must be a positive integer");
+    if (p.earlierContracts !== undefined && !(Array.isArray(p.earlierContracts) && p.earlierContracts.every((e) => /^eip155:\d{1,12}\/0x[0-9a-fA-F]{40}$/.test(String(e))))) {
+      bad("prepaid.earlierContracts must be a list like eip155:43113/0x...");
+    }
     if (typeof p.readChannel !== "function") {
       let rpc;
       try {
@@ -212,22 +219,37 @@ export function createX402Gate(config) {
     }
   }
 
-  /** Serve an already-authorised call (subscription or voucher): roll the counter back when upstream fails. */
+  /** Reads the whole body; null when it is above the cap. Throws when the upstream breaks off. */
+  async function readBody(upstream) {
+    const bytes = new Uint8Array(await upstream.arrayBuffer());
+    return bytes.byteLength > MAX_BODY_BYTES ? null : bytes;
+  }
+
+  function reply(upstream, bytes, headers) {
+    const empty = upstream.status === 204 || upstream.status === 205; // these statuses may not carry a body object
+    return new Response(empty ? null : bytes, { status: upstream.status, statusText: upstream.statusText, headers });
+  }
+
+  /**
+   * Serve an already-authorised call (subscription or voucher): give the use back when upstream fails. Upstream streams are read to the
+   * end before the buyer gets the first byte, so a body that breaks off half way is a failed call: nothing is delivered, nothing is counted.
+   * Once the complete reply is handed over, the call counts, also when the buyer drops the connection.
+   */
   async function serveAuthorised(request, next, undo, extraHeaders) {
     const rollback = () => undo().catch(() => {}); // a store failure here keeps the use counted; the reply stays the upstream error
-    let upstream;
+    let upstream, bytes;
     try {
       upstream = await next(request);
+      if (upstream.status >= 200 && upstream.status < 300) bytes = await readBody(upstream);
     } catch {
       await rollback();
       return json(502, { error: "upstream_failed" });
     }
-    if (!(upstream.status >= 200 && upstream.status < 300)) {
+    if (bytes === undefined) {
       await rollback();
       return upstream;
     }
-    const bytes = new Uint8Array(await upstream.arrayBuffer());
-    if (bytes.byteLength > MAX_BODY_BYTES) {
+    if (bytes === null) {
       await rollback();
       return json(502, { error: "upstream_too_large" });
     }
@@ -235,7 +257,7 @@ export function createX402Gate(config) {
     headers.delete("content-length");
     headers.delete("content-encoding");
     for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
-    return new Response(bytes, { status: upstream.status, statusText: upstream.statusText, headers });
+    return reply(upstream, bytes, headers);
   }
 
   return async function gate(request, next) {
@@ -308,8 +330,13 @@ export function createX402Gate(config) {
     }
 
     // Buffer first so the settlement does not race a half-read stream, and so the cap holds.
-    const bytes = new Uint8Array(await upstream.arrayBuffer());
-    if (bytes.byteLength > MAX_BODY_BYTES) return json(502, { error: "upstream_too_large" });
+    let bytes;
+    try {
+      bytes = await readBody(upstream);
+    } catch {
+      return json(502, { error: "upstream_failed" }); // nothing was settled
+    }
+    if (bytes === null) return json(502, { error: "upstream_too_large" });
 
     const settled = await facilitator("/settle", payload, reqs);
     if (!settled.ok || settled.data?.success !== true) {
@@ -336,6 +363,6 @@ export function createX402Gate(config) {
         /* no token */
       }
     }
-    return new Response(bytes, { status: upstream.status, statusText: upstream.statusText, headers });
+    return reply(upstream, bytes, headers);
   };
 }

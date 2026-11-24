@@ -1,6 +1,6 @@
 {
   "name": "@jkamma/api-seller-kit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Sell any HTTP API per call, prepaid or monthly with x402 on the Hub API market (Avalanche Fuji testnet)",
   "license": "MIT",
@@ -9,9 +9,9 @@
   "main": "src/index.mjs",
   "exports": { ".": "./src/index.mjs", "./store": "./src/store.mjs", "./durable-object": "./src/durable-object.mjs" },
   "bin": { "api-seller-close": "bin/close-channels.mjs" },
-  "files": ["src", "bin", "examples", "README.md", "LICENSE"],
+  "files": ["src", "bin", "examples", "README.md", "CHANGELOG.md", "LICENSE"],
   "scripts": {
-    "test": "node --test test/gate.test.mjs test/prepaid.test.mjs test/monthly.test.mjs test/concurrency.test.mjs",
+    "test": "node --test test/gate.test.mjs test/prepaid.test.mjs test/monthly.test.mjs test/concurrency.test.mjs test/settlement.test.mjs test/scope.test.mjs test/networks.test.mjs",
     "example": "node examples/node-server.mjs"
   },
   "peerDependencies": { "viem": "^2" },
