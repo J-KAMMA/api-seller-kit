@@ -97,7 +97,7 @@ export function createPayments(store, callMs) {
 
     /** { rec } when it is ours now, { existing } otherwise. issuedAt dates the monthly token, whenever it is issued. */
     claim({ key, expiresAt }, owner, request, issuedAt) {
-      const rec = { state: "running", id: newId(), owner, request, at: Date.now(), claimedAt: seconds(), issuedAt, expiresAt };
+      const rec = { state: "running", id: newId(), owner, request, at: Date.now(), issuedAt, expiresAt };
       return casUpdate(store, key, (cur) => (this.isFree(cur) ? { next: rec, result: { rec } } : { result: { existing: cur } }));
     },
     release: (key, id) => step(key, id, ["running"], { state: "released", owner: null }),

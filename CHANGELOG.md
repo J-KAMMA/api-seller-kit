@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 (2026-11-25)
+
+- The default RPC is asked for the block before every settlement, like a named one; only later blocks can prove a payment. Without that block a lost answer stays unclear.
+- Options are read once when the gate is created; later changes to the object have no effect.
+- Payments that fail verification reach the public RPC at most ten times a minute.
+- An empty `prepaid.rpcUrl` next to `readChannel` counts as none; one that is given must be valid.
+
 ## 0.3.1 (2026-11-25)
 
 - Monthly always has an RPC to look up an unclear payment: a public one by default on Fuji and Base Sepolia.

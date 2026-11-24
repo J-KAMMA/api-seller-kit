@@ -6,6 +6,8 @@ const AUTHORIZATION_STATE = "0xe94a0102"; // authorizationState(address,bytes32)
 const AUTHORIZATION_USED = "0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5";
 const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const TIMEOUT_MS = 10_000;
+/** On the way of every payment: short. */
+const START_MS = 5_000;
 /** RPCs limit the range of a log search, some to 100 blocks: start small, grow while it works, halve on an error. */
 const FIRST_CHUNK = 64n;
 const MAX_CHUNK = 2_000n;
@@ -55,25 +57,16 @@ export function createSettlementProof({ rpcUrl, chainId, asset, payTo, doFetch, 
     const b = await rpc("eth_getBlockByNumber", [hex(number), false], until);
     return { time: BigInt(b.timestamp) };
   }
-  /** The last block before a minute before that time: at most one look per doubling of the chain's length. */
-  async function firstBlockFrom(time, head, until) {
-    let low = 0n;
-    let high = head;
-    while (low < high) {
-      const mid = (low + high + 1n) / 2n;
-      if ((await blockAt(mid, until)).time < time - 60n) low = mid;
-      else high = mid - 1n;
-    }
-    return low;
-  }
-
   return {
-    /** Where a later search has to start; null when the chain cannot be read now. */
+    /**
+     * The first block that can hold a settlement asked for after this call; null when the chain cannot be read now. Whatever was settled
+     * up to here was not settled by us.
+     */
     async startBlock() {
       try {
-        await ready();
-        const top = BigInt(await rpc("eth_blockNumber", []));
-        return String(top > depth ? top - depth : 0n); // a reorganisation may move the payment back that far
+        const until = Date.now() + START_MS;
+        await ready(until);
+        return String(BigInt(await rpc("eth_blockNumber", [], until)) + 1n);
       } catch {
         return null;
       }
@@ -96,10 +89,10 @@ export function createSettlementProof({ rpcUrl, chainId, asset, payTo, doFetch, 
 
     /**
      * "paid" (with the transaction), "void", "unused" (not yet, but still valid) or "unclear"; `scannedTo` is where the next look can go on. Never throws.
-     * The search covers every block from startBlock (or, without one, from the time of the claim) to the end of the authorization's
-     * validity. What cannot be covered stays unclear.
+     * The search covers every block from startBlock to the end of the authorization's validity. What cannot be covered stays unclear, and
+     * without a startBlock nothing counts as paid: an earlier settlement is somebody else's.
      */
-    async look({ from, nonce, amount, validBefore, startBlock, claimedAt, until = Infinity }) {
+    async look({ from, nonce, amount, validBefore, startBlock, until = Infinity }) {
       const deadline = Math.min(until, Date.now() + budgetMs); // for searching on
       const hard = Math.min(until, Date.now() + 2 * budgetMs); // for everything
       let next = startBlock === null || startBlock === undefined ? null : BigInt(startBlock);
@@ -113,7 +106,7 @@ export function createSettlementProof({ rpcUrl, chainId, asset, payTo, doFetch, 
         const state = await rpc("eth_call", [{ to: asset, data }, hex(head)], hard);
         if (!/^0x[0-9a-fA-F]{64}$/.test(state)) return unclear();
         if (BigInt(state) === 0n) return validBefore !== null && last.time >= BigInt(validBefore) ? { state: "void" } : { ...unclear(), state: "unused" };
-        next ??= await firstBlockFrom(BigInt(claimedAt), head, hard);
+        if (next === null) return unclear();
         let size = FIRST_CHUNK;
         let cap = MAX_CHUNK;
         let progressed = false; // at least one step per look

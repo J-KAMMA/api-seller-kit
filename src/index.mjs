@@ -31,6 +31,7 @@ const LOCAL_DEV_NETWORK = "eip155:31337";
 const MAX_PAYMENT_HEADER = 16 * 1024;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const FACILITATOR_TIMEOUT_MS = 30_000;
+const MAX_PUBLIC_LOOKS = 10; // a minute, for each gate
 
 /** Header names the Desktop buyer sends / reads (x402 v2), plus the v1 names for other buyers. */
 const REQUEST_HEADERS = ["payment-signature", "x-payment"];
@@ -49,6 +50,34 @@ function base64ToUtf8(b64) {
   const bin = atob(b64);
   const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
   return new TextDecoder().decode(bytes);
+}
+
+const plain = (v) => (v !== null && typeof v === "object" ? String(v) : v);
+const list = (v) => (Array.isArray(v) ? Object.freeze(Array.from(v, plain)) : v);
+
+/** Reads every option once. What the caller changes afterwards, or a getter answers differently, has no effect on a gate that was checked. */
+function snapshot(given) {
+  if (!given || typeof given !== "object") return given;
+  const take = (o, names, lists = [], asIs = []) => {
+    const c = {};
+    for (const n of names) if (n in o) c[n] = plain(o[n]);
+    for (const n of lists) if (n in o) c[n] = list(o[n]);
+    for (const n of asIs) if (n in o) c[n] = o[n];
+    return c;
+  };
+  const c = take(
+    given,
+    ["network", "asset", "payTo", "seller", "priceAtomic", "facilitatorUrl", "description", "resource", "mimeType", "maxTimeoutSeconds", "tokenName", "tokenVersion",
+      "allowLocalDevNetwork", "singleInstance", "upstreamTimeoutMs", "settlementRpcUrl", "storePath"],
+    ["allowedNetworks"],
+    ["fetch", "now", "store", "facilitatorHeaders", "prepaid", "monthly"],
+  );
+  const isObject = (v) => v !== null && typeof v === "object";
+  if (isObject(c.facilitatorHeaders)) c.facilitatorHeaders = Object.freeze({ ...c.facilitatorHeaders });
+  if (isObject(c.prepaid)) c.prepaid = Object.freeze(take(c.prepaid, ["pricePerCallAtomic", "channelContract", "minDepositAtomic", "rpcUrl", "callTimeoutMs"], ["earlierContracts"], ["readChannel"]));
+  if (isObject(c.monthly)) c.monthly = Object.freeze(take(c.monthly, ["priceAtomic", "quota", "subscriptionSecret"], ["acceptPrices"]));
+  for (const n of Object.keys(c)) if (c[n] === undefined) delete c[n];
+  return Object.freeze(c);
 }
 
 function assertConfig(c) {
@@ -93,7 +122,7 @@ function assertConfig(c) {
     if (p.earlierContracts !== undefined && !(Array.isArray(p.earlierContracts) && p.earlierContracts.every((e) => /^eip155:\d{1,12}\/0x[0-9a-fA-F]{40}$/.test(String(e))))) {
       bad("prepaid.earlierContracts must be a list like eip155:43113/0x...");
     }
-    if (typeof p.readChannel !== "function") {
+    if (typeof p.readChannel !== "function" || p.rpcUrl) {
       let rpc;
       try {
         rpc = new URL(p.rpcUrl);
@@ -116,7 +145,7 @@ function assertConfig(c) {
     } catch {
       bad("monthly needs resource: the public address of this API");
     }
-    if (c.settlementRpcUrl === undefined && c.prepaid?.rpcUrl === undefined && !Object.hasOwn(PUBLIC_RPC, c.network)) bad("monthly on this network needs settlementRpcUrl");
+    if (!c.settlementRpcUrl && !c.prepaid?.rpcUrl && !Object.hasOwn(PUBLIC_RPC, c.network)) bad("monthly on this network needs settlementRpcUrl");
     if (!/^https?:$/.test(resource.protocol)) bad("resource must be an http(s) address");
     if (typeof m.subscriptionSecret !== "string" || m.subscriptionSecret.length < 16) bad("monthly.subscriptionSecret must be a string of 16+ characters");
   }
@@ -126,7 +155,8 @@ function assertConfig(c) {
  * @param {GateConfig} config
  * @returns {(request: Request, next: (request: Request) => Promise<Response>) => Promise<Response>}
  */
-export function createX402Gate(config) {
+export function createX402Gate(given) {
+  const config = snapshot(given);
   assertConfig(config);
   const doFetch = config.fetch ?? ((input, init) => globalThis.fetch(input, init)); // Workers: keep fetch bound
   const base = config.facilitatorUrl.replace(/\/+$/, "");
@@ -154,11 +184,21 @@ export function createX402Gate(config) {
     console.warn("x402 gate: payments are remembered by this process only; pass a store with compareAndSet when several instances run, or singleInstance: true");
   }
   const subs = config.monthly ? createSubscriptions({ seller: config.seller, network: config.network, monthly: config.monthly, store, now: config.now, resource: config.resource }) : null;
-  // A month that was paid must be collectable whatever the facilitator answers, so monthly always has an RPC. The public default is asked only
-  // when something is unclear, never on the way of a normal payment.
-  const namedRpc = config.settlementRpcUrl ?? config.prepaid?.rpcUrl;
+  // A month that was paid must be collectable whatever the facilitator answers, so monthly always has an RPC. The public default is asked
+  // for the block before every settlement, and when something is unclear.
+  const namedRpc = config.settlementRpcUrl ?? (config.prepaid?.rpcUrl || undefined);
   const proofRpc = namedRpc ?? (config.monthly ? PUBLIC_RPC[config.network] : undefined);
   const proof = proofRpc ? createSettlementProof({ rpcUrl: proofRpc, chainId: Number(config.network.split(":")[1]), asset: config.asset, payTo: config.payTo, doFetch, depth: settledDepth(config.network) }) : null;
+  /** Lookups for payments that failed /verify cost their sender nothing, so the public default RPC gets only a few of them. */
+  let looks = [];
+  const mayLook = (payload, verified) => {
+    if (/signature/i.test(String(verified.data?.invalidReason ?? ""))) return false; // never was a payment
+    if (namedRpc) return true;
+    if (!/^0x([0-9a-fA-F]{2}){65,}$/.test(String(payload.payload?.signature))) return false;
+    const now = Date.now();
+    looks = looks.filter((t) => now - t < 60_000);
+    return looks.length < MAX_PUBLIC_LOOKS && looks.push(now) > 0;
+  };
   const upstreamTimeout = config.upstreamTimeoutMs ?? 300_000;
   const payments = createPayments(store ?? createMemoryStore(), upstreamTimeout);
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
@@ -421,9 +461,9 @@ export function createX402Gate(config) {
       ...(rec.token ? { [SUBSCRIPTION_HEADER]: rec.token } : {}),
     });
     /** Asks the chain. Returns a settlement when it proves that this authorization paid this seller. */
-    const proven = async (startBlock, claimedAt, until) => {
+    const proven = async (startBlock, until) => {
       if (!proof) return { state: "unclear" };
-      const found = await proof.look({ from: payment.from, nonce: payment.nonce, amount: reqs.amount, validBefore: payment.validBefore, startBlock, claimedAt, until });
+      const found = await proof.look({ from: payment.from, nonce: payment.nonce, amount: reqs.amount, validBefore: payment.validBefore, startBlock, until });
       return found.state === "paid" ? { state: "paid", settled: { data: { transaction: found.transaction, payer: payment.from } } } : found;
     };
 
@@ -452,7 +492,7 @@ export function createX402Gate(config) {
       // See settlement-table.mjs. The chain is asked first: a facilitator may answer a settled authorization with a failure, because its nonce is used.
       const until = Date.now() + ATTEMPT_MS;
       let first = rec.first ?? "ambiguous";
-      let chain = await proven(rec.startBlock, rec.claimedAt, until);
+      let chain = await proven(rec.startBlock, until);
       let verdict = decide(first, chain.state);
       if (verdict === "unclear" && first !== "contested") {
         const before = chain.state;
@@ -463,7 +503,7 @@ export function createX402Gate(config) {
           chain = { state: "paid", settled };
         } else {
           first = reclassify(first, again, before);
-          chain = { scannedTo: chain.scannedTo, ...(await proven(chain.scannedTo ?? rec.startBlock, rec.claimedAt, until)) };
+          chain = { scannedTo: chain.scannedTo, ...(await proven(chain.scannedTo ?? rec.startBlock, until)) };
         }
         verdict = decide(first, chain.state);
       }
@@ -502,7 +542,7 @@ export function createX402Gate(config) {
     if (verified.data === null && !verified.ok) return failed(502, "facilitator_unavailable", "refused");
     if (!verified.ok || verified.data?.isValid !== true || !payment) {
       // No record (any more). Whether the same payment was settled before, only the chain can say.
-      const state = payment && proof ? await proof.used(payment) : "unclear";
+      const state = payment && proof && mayLook(payload, verified) ? await proof.used(payment) : "unclear";
       if (state === "used") return failed(409, "payment_already_used", "unclear");
       return state === "void" ? quote(request, "payment_expired", undefined, "not_taken") : quote(request, "payment_invalid", undefined, "refused");
     }
@@ -535,7 +575,7 @@ export function createX402Gate(config) {
 
     let startBlock = null;
     try {
-      startBlock = namedRpc ? await proof.startBlock() : null; // without it a search starts at the time of the claim
+      startBlock = proof ? await proof.startBlock() : null; // without it only the facilitator's own answer counts
       if (!(await payments.settling(payment.key, claim.rec.id, startBlock))) return failed(409, "payment_in_progress", "unclear"); // another request took it over after the lease
     } catch {
       await release();
@@ -546,7 +586,7 @@ export function createX402Gate(config) {
     const first = classify(settled);
     if (first !== "ok") {
       // The claim is ours and nothing handed out yet: when the chain proves an ambiguous payment, it is served after all.
-      const chain = first === "ambiguous" ? await proven(startBlock, claim.rec.claimedAt, until) : { state: "unclear" };
+      const chain = first === "ambiguous" ? await proven(startBlock, until) : { state: "unclear" };
       if (decide(first, chain.state) !== "serve") {
         await payments.unclear(payment.key, claim.rec.id, { first, scannedTo: chain.scannedTo }).catch(() => {});
         return failed(409, "settlement_unclear", "unclear"); // fail closed: the body is withheld
