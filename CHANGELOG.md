@@ -5,6 +5,7 @@
 - When the block cannot be read before a settlement, nothing is settled: 503 `chain_unavailable`, `not_taken`. Before, such a payment could stay unclear after a lost answer.
 - Waiting for the RPC's chain id ends at the caller's deadline.
 - `examples/worker-closer/`: closes prepaid channels from a Worker on a timer. `--only-requested` with `MIN_AMOUNT` also closes channels that reached it. A run can stop early (`shouldContinue`) and leaves the rest to the next one. A seller Worker on the same Cloudflare account is reached through a service binding `SELLER_WORKER`.
+- Examples: `/openapi.json` is free in the prepaid example too.
 - README: one shared store per `payTo` is required; the block check does not replace it. The lookup limit counts per process or isolate.
 
 ## 0.3.2 (2026-11-25)

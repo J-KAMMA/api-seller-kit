@@ -40,7 +40,7 @@ async function api(request) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/openapi.json") { // 入口（/）は門の後ろ：Hub の出品の確かめが 402 を見られるように
+    if (url.pathname === "/openapi.json") { // free; the root stays behind the gate, so Hub's listing check sees the 402
       return Response.json({
         openapi: "3.1.0",
         info: { title: "echo (Hub API market sample)", version: "1", description: "Avalanche Fuji testnet only. Pay per call with x402 or monthly." },
