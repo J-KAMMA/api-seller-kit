@@ -6,7 +6,9 @@ export default {
     ctx.waitUntil(
       runCloser(env).then(
         (r) => console.log(JSON.stringify({ closed: r.closed.length, failed: r.failed, postponed: r.postponed.length, subrequests: r.subrequests })),
-        (e) => console.log(`worker-closer: ${e.message}`), // the messages name settings, never their values
+        // Our own messages name a setting, never its value. Anything else (from the RPC library: it can contain the RPC address and the
+        // request) is logged as a category only.
+        (e) => console.log(String(e?.message).startsWith("worker-closer: ") ? e.message : `worker-closer: run failed (${e?.name ?? "Error"})`),
       ),
     );
   },

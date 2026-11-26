@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4 (2026-11-26)
+
+- Closing Worker: with several channels a run spent its budget on looking and closed nothing. It now takes one channel after the other, starting one further on at every run, and looks at a channel only while a close still fits; the wait for a receipt also stops at the budget. `MAX_SUBREQUESTS` must be at least 36.
+- Closing Worker: errors from the RPC library are logged as a category, never with the RPC address.
+- `closeChannels`: `oneByOne`, `startAt`; `shouldContinue` is told whether the next step looks or closes. `createCloseChain`: `canPoll`.
+- README: what happens when the block or the store cannot be read, exactly.
+
 ## 0.3.3 (2026-11-26)
 
 - When the block cannot be read before a settlement, nothing is settled: 503 `chain_unavailable`, `not_taken`. Before, such a payment could stay unclear after a lost answer.

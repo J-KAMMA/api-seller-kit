@@ -32,7 +32,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *           readChannel: (channelId: string) => Promise<{buyer:string, seller:string, status:number, deposit:bigint, closeRequestedAt?:bigint}>,
  *           settledChannel?: (channelId: string) => Promise<{status:number}>,
  *           snapshot?: (channelId: string, from: string) => Promise<{status:number, nonce:number}>,
- *           sendClose: Function, drainMs?: number, onlyRequested?: boolean, shouldContinue?: () => boolean, minAmountAtomic?: bigint, challengeSeconds?: number, chainTime?: () => Promise<number>,
+ *           sendClose: Function, drainMs?: number, onlyRequested?: boolean, shouldContinue?: (step: "look" | "close") => boolean, oneByOne?: boolean, order?: (ids: string[]) => Promise<string[]>, minAmountAtomic?: bigint, challengeSeconds?: number, chainTime?: () => Promise<number>,
  *           dryRun?: boolean, log?: (line: string) => void }} o
  * @returns {Promise<{ closed: string[], wouldClose: string[], skipped: {channelId:string, reason:string}[], failed: {channelId:string, reason:string}[],
  *                     drainTimedOut: {channelId:string, calls:number}[], postponed: string[] }>}
@@ -45,7 +45,7 @@ export async function closeChannels(o) {
   const contract = o.channelContract.toLowerCase();
   const seller = o.seller.toLowerCase();
   const out = { closed: [], wouldClose: [], skipped: [], failed: [], drainTimedOut: [], postponed: [] };
-  const more = () => (o.shouldContinue ? o.shouldContinue() : true); // a budget of the caller: what is left waits for the next run
+  const more = (step) => (o.shouldContinue ? o.shouldContinue(step) : true); // a budget of the caller: what is left waits for the next run
   const skip = (channelId, reason) => void out.skipped.push({ channelId, reason });
   const failed = (channelId, reason) => void out.failed.push({ channelId, reason });
   const chainTime = o.chainTime ?? (async () => Math.floor(Date.now() / 1000));
@@ -284,9 +284,29 @@ export async function closeChannels(o) {
     if (Array.isArray(index)) for (const id of index) ids.add(id);
   }
   const challengeMs = (o.challengeSeconds ?? 0) * 1000; // unknown: no waiting
+  if (o.oneByOne) {
+    // Each channel is looked at and, if due, closed right away, in the order the caller gives (the most urgent first): with a small budget
+    // every run gets the most urgent thing done.
+    const turn = o.order ? await o.order([...ids]) : [...ids];
+    const runUntil = Date.now() + (o.drainMs ?? 0);
+    for (const [i, channelId] of turn.entries()) {
+      if (!more("look")) {
+        out.postponed.push(...turn.slice(i));
+        break;
+      }
+      try {
+        const candidate = await prepare(channelId);
+        const job = candidate && (await claim(candidate));
+        if (job) await send(job, runUntil);
+      } catch {
+        failed(channelId, "store_unavailable");
+      }
+    }
+    return out;
+  }
   const jobs = [];
   for (const channelId of ids) {
-    if (!more()) {
+    if (!more("look")) {
       out.postponed.push(channelId);
       continue;
     }
@@ -301,7 +321,7 @@ export async function closeChannels(o) {
   jobs.sort((a, b) => (a.requestedAt || Infinity) - (b.requestedAt || Infinity) || 0);
   const runUntil = Date.now() + (o.drainMs ?? 0);
   for (const candidate of jobs) {
-    if (!more()) {
+    if (!more("close")) {
       out.postponed.push(candidate.channelId);
       continue;
     }

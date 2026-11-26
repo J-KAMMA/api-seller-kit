@@ -9,12 +9,21 @@ import { privateKeyToAccount } from "viem/accounts";
 import { createRemoteStore } from "../../src/admin-store.mjs";
 import { createCloseChain } from "../../src/close-chain.mjs";
 import { closeChannels } from "../../src/close.mjs";
+import { CHANNEL_ABI } from "../../src/channel.mjs";
 import { settledDepth } from "../../src/networks.mjs";
+import { channelKeys, LEGACY_KEYS } from "../../src/voucher-record.mjs";
 
 const TESTNETS = { "eip155:43113": 43113, "eip155:84532": 84532 };
-/** Requests one channel needs at most: reads and claims, the transaction, and the waiting (one look every POLL_MS). */
 const POLL_MS = 5_000;
-const perChannel = (waitMs) => 20 + 3 * Math.ceil(waitMs / POLL_MS);
+/** Requests (chain and store) that looking at one channel can take, and closing it without the waiting; measured with the fake RPC of the tests. */
+export const LOOK_COST = 4;
+/** Channels read from the chain in one request (a JSON-RPC batch), to know which ones are due. */
+const BATCH = 20;
+export const CLOSE_COST = 24;
+/** What a close needs after its last look while waiting: the checks of the outcome and the mark. */
+const AFTER_WAIT = 8;
+const RUN_MS = 15 * 60 * 1000;
+void channelKeys, void LEGACY_KEYS;
 
 /** Throws with a message that names the setting, never its value. */
 export function settings(env) {
@@ -51,11 +60,13 @@ export function settings(env) {
     minAmountAtomic: BigInt(whole("MIN_AMOUNT", 0)),
     drainMs: Number(whole("DRAIN_SECONDS", 0, 60)) * 1000,
     subrequests: Number(whole("MAX_SUBREQUESTS", 45, 1000)), // 50 a run on the free plan
+    // a close must fit in a run whatever else happens in it
+    ...(Number(env.MAX_SUBREQUESTS ?? 45) < LOOK_COST + CLOSE_COST + 8 ? bad("MAX_SUBREQUESTS must be at least 36") : {}),
   };
 }
 
 /**
- * One run. deps (tests): { chain, store, fetch }. Returns the result of closeChannels, without anything secret.
+ * One run. deps (tests): { chain, store, fetch, now }. Returns the result of closeChannels, without anything secret.
  * @param {Record<string,string>} env
  */
 export async function runCloser(env, deps = {}) {
@@ -67,17 +78,25 @@ export async function runCloser(env, deps = {}) {
   };
   const account = privateKeyToAccount(env.SELLER_PRIVATE_KEY);
   let chain = deps.chain;
+  let readAll = null; // all channels' state in few requests
   if (!chain) {
     const viemChain = defineChain({ id: s.chainId, name: `chain-${s.chainId}`, nativeCurrency: { name: "Native", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [s.rpcUrl] } } });
     const publicClient = createPublicClient({ chain: viemChain, transport: http(s.rpcUrl, { fetchFn: counted, retryCount: 0 }) });
+    const batched = createPublicClient({ chain: viemChain, transport: http(s.rpcUrl, { fetchFn: counted, retryCount: 0, batch: { batchSize: BATCH, wait: 0 } }) });
+    readAll = async (ids) => {
+      const states = await Promise.all(ids.map((id) => batched.readContract({ address: s.channelContract, abi: CHANNEL_ABI, functionName: "getChannel", args: [id] }).catch(() => null)));
+      return ids.map((id, i) => ({ id, closeRequestedAt: states[i] && Number(states[i].status) === 1 ? BigInt(states[i].closeRequestedAt) : 0n }));
+    };
     if (Number(await publicClient.getChainId()) !== s.chainId) throw new Error("worker-closer: RPC_URL is on another chain than NETWORK");
-    chain = createCloseChain({ publicClient, account, channelContract: s.channelContract, chainId: s.chainId, maxFeePerGas: s.maxFeePerGas, waitMs: s.waitMs, pollMs: POLL_MS, depth: settledDepth(s.network) });
+    chain = createCloseChain({
+      publicClient, account, channelContract: s.channelContract, chainId: s.chainId, maxFeePerGas: s.maxFeePerGas, waitMs: s.waitMs, pollMs: POLL_MS, depth: settledDepth(s.network),
+      canPoll: () => used + 3 + AFTER_WAIT <= s.subrequests, // a look while waiting takes three
+    });
   }
   // A seller Worker on the same Cloudflare account cannot be reached through its public address: bind it as SELLER_WORKER instead.
   const binding = env.SELLER_WORKER && typeof env.SELLER_WORKER.fetch === "function" ? env.SELLER_WORKER : null;
   const storeFetch = binding ? async (input, init) => (used++, binding.fetch(input, init)) : counted;
   const store = deps.store ?? createRemoteStore(s.storeUrl, env.STORE_SECRET, { fetch: storeFetch });
-  const reserve = perChannel(s.waitMs);
   const result = await closeChannels({
     store,
     chainId: s.chainId,
@@ -92,8 +111,19 @@ export async function runCloser(env, deps = {}) {
     settledChannel: chain.settledChannel,
     snapshot: chain.snapshot,
     sendClose: chain.sendClose,
-    // Stop before a channel could run out of requests half way: it is safe, but it is wasted.
-    shouldContinue: () => used + reserve <= s.subrequests,
+    // One channel after the other, so that every run closes something, and a channel is looked at only while a close still fits.
+    // First the channels whose buyer asked to close, the oldest request first; then the others, starting one further on at every run.
+    oneByOne: true,
+    order: async (ids) => {
+      const run = Math.floor((deps.now ?? Date.now)() / RUN_MS);
+      const sorted = [...ids].sort();
+      const turn = sorted.length ? run % sorted.length : 0;
+      const rest = [...sorted.slice(turn), ...sorted.slice(0, turn)];
+      const states = readAll ? await readAll(sorted) : await Promise.all(sorted.map(async (id) => ({ id, closeRequestedAt: BigInt((await chain.readChannel(id).catch(() => ({})))?.closeRequestedAt ?? 0) })));
+      const asked = states.filter((x) => x.closeRequestedAt > 0n).sort((a, b) => (a.closeRequestedAt < b.closeRequestedAt ? -1 : a.closeRequestedAt > b.closeRequestedAt ? 1 : 0)).map((x) => x.id);
+      return [...asked, ...rest.filter((id) => !asked.includes(id))];
+    },
+    shouldContinue: () => used + LOOK_COST + CLOSE_COST + AFTER_WAIT <= s.subrequests,
   });
   return { ...result, subrequests: used };
 }

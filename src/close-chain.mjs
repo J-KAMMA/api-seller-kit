@@ -10,9 +10,10 @@ const max = (a, b) => (a > b ? a : b);
 
 /**
  * @param {{ publicClient: object, account: object|null, channelContract: string, chainId: number, maxFeePerGas: bigint,
- *           waitMs?: number, pollMs?: number, depth?: bigint }} o  depth: blocks below the head that count as settled
+ *           waitMs?: number, pollMs?: number, depth?: bigint, canPoll?: () => boolean }} o  depth: blocks below the head that count as settled;
+ *           canPoll: asked before every look while waiting (a budget of requests)
  */
-export function createCloseChain({ publicClient, account, channelContract, chainId, maxFeePerGas, waitMs = 120_000, pollMs = 1_000, depth = 0n }) {
+export function createCloseChain({ publicClient, account, channelContract, chainId, maxFeePerGas, waitMs = 120_000, pollMs = 1_000, depth = 0n, canPoll = () => true }) {
   const read = async (functionName, args, blockNumber) =>
     publicClient.readContract({ address: channelContract, abi: CONTRACT_ABI, functionName, args, ...(blockNumber === undefined ? {} : { blockNumber }) });
   const readChannel = async (channelId, blockNumber) => {
@@ -79,7 +80,7 @@ export function createCloseChain({ publicClient, account, channelContract, chain
         throw new Error("closed_by_another_transaction", { cause: sendError });
       }
       if (s.nonce > tx.nonce) throw notSent("close_failed", sendError); // reverted, or another transaction took the nonce
-      if (Date.now() >= until) throw new Error("unconfirmed", { cause: sendError });
+      if (Date.now() >= until || !canPoll()) throw new Error("unconfirmed", { cause: sendError }); // the next run finishes it
       await sleep(pollMs);
     }
   }
