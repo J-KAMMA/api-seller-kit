@@ -2,3 +2,6 @@ node_modules/
 *-store.json
 .wrangler/
 .dev.vars
+
+# local deploy configs
+*.sample.jsonc
