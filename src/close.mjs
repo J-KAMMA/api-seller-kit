@@ -32,10 +32,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *           readChannel: (channelId: string) => Promise<{buyer:string, seller:string, status:number, deposit:bigint, closeRequestedAt?:bigint}>,
  *           settledChannel?: (channelId: string) => Promise<{status:number}>,
  *           snapshot?: (channelId: string, from: string) => Promise<{status:number, nonce:number}>,
- *           sendClose: Function, drainMs?: number, onlyRequested?: boolean, minAmountAtomic?: bigint, challengeSeconds?: number, chainTime?: () => Promise<number>,
+ *           sendClose: Function, drainMs?: number, onlyRequested?: boolean, shouldContinue?: () => boolean, minAmountAtomic?: bigint, challengeSeconds?: number, chainTime?: () => Promise<number>,
  *           dryRun?: boolean, log?: (line: string) => void }} o
  * @returns {Promise<{ closed: string[], wouldClose: string[], skipped: {channelId:string, reason:string}[], failed: {channelId:string, reason:string}[],
- *                     drainTimedOut: {channelId:string, calls:number}[] }>}
+ *                     drainTimedOut: {channelId:string, calls:number}[], postponed: string[] }>}
  */
 export async function closeChannels(o) {
   const log = o.log ?? (() => {});
@@ -44,7 +44,8 @@ export async function closeChannels(o) {
   const keys = channelKeys(o.chainId, o.channelContract);
   const contract = o.channelContract.toLowerCase();
   const seller = o.seller.toLowerCase();
-  const out = { closed: [], wouldClose: [], skipped: [], failed: [], drainTimedOut: [] };
+  const out = { closed: [], wouldClose: [], skipped: [], failed: [], drainTimedOut: [], postponed: [] };
+  const more = () => (o.shouldContinue ? o.shouldContinue() : true); // a budget of the caller: what is left waits for the next run
   const skip = (channelId, reason) => void out.skipped.push({ channelId, reason });
   const failed = (channelId, reason) => void out.failed.push({ channelId, reason });
   const chainTime = o.chainTime ?? (async () => Math.floor(Date.now() / 1000));
@@ -123,8 +124,10 @@ export async function closeChannels(o) {
     const requestedAt = Number(ch.closeRequestedAt ?? 0n);
     // A claim that is there already is always followed up: it keeps the buyer out until it is resolved.
     if (requestedAt === 0 && !rec.closing) {
-      if (o.onlyRequested) return skip(channelId, "close_not_requested");
-      if (amount < BigInt(o.minAmountAtomic ?? 0n)) return skip(channelId, "below_minimum");
+      const minimum = BigInt(o.minAmountAtomic ?? 0n);
+      // only-requested: a channel nobody asked to close is closed only once it holds the minimum (when one is set)
+      if (o.onlyRequested && !(minimum > 0n && amount >= minimum)) return skip(channelId, "close_not_requested");
+      if (amount < minimum) return skip(channelId, "below_minimum");
     } else if (requestedAt !== 0 && challengeMs !== 0 && (await chainTime()) * 1000 >= requestedAt * 1000 + challengeMs) {
       return skip(channelId, "challenge_period_over");
     }
@@ -283,6 +286,10 @@ export async function closeChannels(o) {
   const challengeMs = (o.challengeSeconds ?? 0) * 1000; // unknown: no waiting
   const jobs = [];
   for (const channelId of ids) {
+    if (!more()) {
+      out.postponed.push(channelId);
+      continue;
+    }
     try {
       const job = await prepare(channelId);
       if (job) jobs.push(job);
@@ -294,6 +301,10 @@ export async function closeChannels(o) {
   jobs.sort((a, b) => (a.requestedAt || Infinity) - (b.requestedAt || Infinity) || 0);
   const runUntil = Date.now() + (o.drainMs ?? 0);
   for (const candidate of jobs) {
+    if (!more()) {
+      out.postponed.push(candidate.channelId);
+      continue;
+    }
     try {
       const job = await claim(candidate);
       if (job) await send(job, runUntil);

@@ -1,8 +1,15 @@
 # Changelog
 
+## 0.3.3 (2026-11-26)
+
+- When the block cannot be read before a settlement, nothing is settled: 503 `chain_unavailable`, `not_taken`. Before, such a payment could stay unclear after a lost answer.
+- Waiting for the RPC's chain id ends at the caller's deadline.
+- `examples/worker-closer/`: closes prepaid channels from a Worker on a timer. `--only-requested` with `MIN_AMOUNT` also closes channels that reached it. A run can stop early (`shouldContinue`) and leaves the rest to the next one. A seller Worker on the same Cloudflare account is reached through a service binding `SELLER_WORKER`.
+- README: one shared store per `payTo` is required; the block check does not replace it. The lookup limit counts per process or isolate.
+
 ## 0.3.2 (2026-11-25)
 
-- The default RPC is asked for the block before every settlement, like a named one; only later blocks can prove a payment. Without that block a lost answer stays unclear.
+- The default RPC is asked for the block before every settlement, like a named one; only later blocks can prove a payment. This does not make separate stores safe (see 0.3.3).
 - Options are read once when the gate is created; later changes to the object have no effect.
 - Payments that fail verification reach the public RPC at most ten times a minute.
 - An empty `prepaid.rpcUrl` next to `readChannel` counts as none; one that is given must be valid.

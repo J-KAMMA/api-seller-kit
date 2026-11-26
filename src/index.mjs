@@ -575,7 +575,12 @@ export function createX402Gate(given) {
 
     let startBlock = null;
     try {
-      startBlock = proof ? await proof.startBlock() : null; // without it only the facilitator's own answer counts
+      startBlock = proof ? await proof.startBlock() : null;
+      if (proof && startBlock === null) {
+        // Without the block a lost answer could never be cleared up: rather settle nothing. /settle was not called.
+        await release();
+        return failed(503, "chain_unavailable", "not_taken", { "retry-after": "10" });
+      }
       if (!(await payments.settling(payment.key, claim.rec.id, startBlock))) return failed(409, "payment_in_progress", "unclear"); // another request took it over after the lease
     } catch {
       await release();

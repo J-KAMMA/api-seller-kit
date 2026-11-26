@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { closeChannels } from "../src/close.mjs";
 import { createMemoryStore } from "../src/store.mjs";
-import { A, BUYER, CHANNEL_ID, channelGate, monthlyGate, purchase, quotaKey, quotaToken, useToken, useVoucher, voucher } from "./fixtures/gates.mjs";
+import { A, BUYER, CHANNEL_ID, fakeRpc, channelGate, monthlyGate, purchase, quotaKey, quotaToken, useToken, useVoucher, voucher } from "./fixtures/gates.mjs";
 
 const KEY = `channel:43113:${A("c")}:${CHANNEL_ID}`;
 const LEGACY = `channel:${CHANNEL_ID}`;
@@ -338,7 +338,7 @@ test("upstream body breaks off: 502, nothing delivered, the use is given back (v
 
   const paths = [];
   const exact = monthlyGate(createMemoryStore(), 5, {
-    fetch: async (url) => (paths.push(new URL(url).pathname), new Response(JSON.stringify({ isValid: true, success: true }))),
+    fetch: async (url, init) => fakeRpc(url, init) ?? (paths.push(new URL(url).pathname), new Response(JSON.stringify({ isValid: true, success: true }))),
   });
   const pay = { payload: { authorization: { from: A("4"), nonce: `0x${"1".repeat(64)}` } } };
   res = await call(exact, { "payment-signature": Buffer.from(JSON.stringify(pay)).toString("base64") }, async () => breaking());

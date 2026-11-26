@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { createHmac } from "node:crypto";
 import { createX402Gate } from "../src/index.mjs";
 import { createFileStore, createMemoryStore } from "../src/store.mjs";
+import { fakeRpc } from "./fixtures/gates.mjs";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +32,8 @@ function setup({ quota = 2, now = () => 1_000_000, plan } = {}) {
     store,
     now,
     fetch: async (url, init) => {
+      const chain = fakeRpc(url, init);
+      if (chain) return chain;
       const path = new URL(url).pathname;
       calls.push([path, JSON.parse(init.body).paymentRequirements.amount]);
       return new Response(JSON.stringify(path === "/verify" ? { isValid: true } : { success: true, transaction: "0xabc", payer: BUYER }));
@@ -177,7 +180,7 @@ test("token for another API origin is refused", async () => {
     createX402Gate({
       network: "eip155:43113", asset: USDC, payTo: A("2"), seller: A("3"), priceAtomic: "10000", facilitatorUrl: "https://f.example", resource,
       monthly: { priceAtomic: "5000000", quota: null, subscriptionSecret: SECRET }, store: createMemoryStore(), now: () => 1_000_000,
-      fetch: async (url) => new Response(JSON.stringify(new URL(url).pathname === "/verify" ? { isValid: true } : { success: true })),
+      fetch: async (url, init) => fakeRpc(url, init) ?? new Response(JSON.stringify(new URL(url).pathname === "/verify" ? { isValid: true } : { success: true })),
     });
   const a = mk("https://one.example/echo");
   const token = (await a(new Request("https://one.example/echo", { headers: { "payment-signature": monthlyPayment() } }), ok)).headers.get("hub-subscription");

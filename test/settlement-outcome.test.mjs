@@ -659,7 +659,7 @@ test("a normal payment asks the default RPC for the block only; other networks n
   assert.deepEqual(await told(await go()), [200, "settled"]);
   assert.deepEqual(methods, ["eth_chainId", "eth_blockNumber"]);
   const down = plainMonthly({ settle: () => Response.json({ success: true, transaction: "0xtx" }), rpcUrls: () => Promise.reject(new Error("down")) });
-  assert.deepEqual(await told(await down.go()), [200, "settled"]); // a plain success needs no chain
+  assert.deepEqual(await told(await down.go()), [503, "not_taken"]); // nothing is settled that could not be looked up
   const base = { asset: "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e", payTo: A("2"), seller: A("3"), priceAtomic: "1", facilitatorUrl: "http://127.0.0.1:1", resource: "https://api.example/echo", store: createMemoryStore(), monthly: { priceAtomic: "1", quota: null, subscriptionSecret: "s".repeat(32) } };
   for (const o of [{ network: "eip155:31337", allowLocalDevNetwork: true }]) {
     assert.throws(() => createX402Gate({ ...base, ...o }), /settlementRpcUrl/);
@@ -735,7 +735,7 @@ async function twoGates({ named, down = false, sameBlock = false, network = "eip
 test("another gate's settlement is never taken for the own one, with a named RPC or the default, in the same block or when the chain cannot be read", async () => {
   for (const network of ["eip155:43113", "eip155:84532"]) {
     for (const named of [true, false]) {
-      for (const o of [{}, { sameBlock: true }, { down: true }]) {
+      for (const o of [{}, { sameBlock: true }]) {
         const { c, first, second, again } = await twoGates({ named, network, ...o });
         assert.deepEqual(await told(second), [200, "settled"]);
         for (const res of [first, again]) {
@@ -748,17 +748,36 @@ test("another gate's settlement is never taken for the own one, with a named RPC
   }
 });
 
-test("the block could not be read before settling: the own lost settlement stays unclear, and is served once the facilitator settles it", async () => {
-  let w = world({ reads: false });
-  assert.deepEqual(await told(await w.go()), [409, "unclear"]);
-  w.reads = true;
-  for (let i = 0; i < 2; i++) assert.deepEqual(await told(await w.go()), [409, "unclear"]);
-  assert.equal(w.calls, 1);
-  w = world({ mode: "never", reads: false });
-  assert.deepEqual(await told(await w.go()), [409, "unclear"]);
-  w.reads = true;
-  w.answer = () => ((w.used = true), Response.json({ success: true, transaction: "0xtx" }));
-  assert.deepEqual(await told(await w.go()), [200, "settled"]);
+test("the block cannot be read before settling: nothing is sent to the facilitator, the same payment works later, also when that answer is lost", async () => {
+  for (const mode of ["lost", "ok"]) {
+    const w = world({ mode, reads: false });
+    const res = await w.go();
+    assert.deepEqual(await told(res), [503, "not_taken"]);
+    assert.deepEqual([(await res.json()).safeToPayAgain, w.settles], [true, 0]);
+    w.reads = true;
+    assert.deepEqual(await told(await w.go()), [200, "settled"]); // with "lost", the chain shows it right away
+    assert.equal(w.settles, 1);
+  }
+});
+
+test("waiting for the chain id ends at the caller's deadline, also when another request is already waiting for it", async () => {
+  let answer;
+  const p = createSettlementProof({
+    rpcUrl: "https://rpc.example", chainId: 43113, asset: USDC, payTo: A("2"),
+    doFetch: async (u, init) => {
+      const { method } = JSON.parse(init.body);
+      if (method === "eth_chainId") await new Promise((r) => (answer = r));
+      return Response.json({ result: { eth_chainId: "0xa869", eth_blockNumber: "0x64", eth_call: word("0x0"), eth_getBlockByNumber: { timestamp: "0x1" } }[method] });
+    },
+  });
+  const slow = p.used({ from: FROM, nonce: NONCE, validBefore: null }); // no deadline of its own
+  const started = Date.now();
+  assert.equal(await p.startBlock(), null);
+  const took = Date.now() - started;
+  assert.ok(took >= 4_500 && took < 6_500, String(took));
+  answer();
+  assert.equal(await slow, "unused");
+  assert.equal(await p.startBlock(), "101"); // the answer came and is kept
 });
 
 test("a gate keeps the options it was created with", async () => {

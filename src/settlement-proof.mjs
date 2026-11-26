@@ -40,15 +40,21 @@ export function createSettlementProof({ rpcUrl, chainId, asset, payTo, doFetch, 
       clearTimeout(timer);
     }
   }
-  async function ready(until) {
-    checked ??= rpc("eth_chainId", [], until).then((id) => {
+  /** The chain id, read once; waiting for it (also for another caller's request) ends at this caller's deadline. */
+  async function ready(until = Infinity) {
+    checked ??= rpc("eth_chainId", []).then((id) => {
       if (Number(id) !== chainId) throw new Error("rpc_on_another_chain");
     });
+    const mine = checked;
+    let timer;
+    const late = Number.isFinite(until) ? new Promise((_, no) => (timer = setTimeout(() => no(new Error("too_late")), Math.max(0, until - Date.now())))) : null;
     try {
-      await checked;
+      await (late ? Promise.race([mine, late]) : mine);
     } catch (e) {
-      checked = null;
+      if (e?.message !== "too_late" && checked === mine) checked = null;
       throw e;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

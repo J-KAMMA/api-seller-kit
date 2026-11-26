@@ -79,9 +79,11 @@ STORE_URL=https://YOUR_WORKER/__seller-store STORE_SECRET=… SELLER_PRIVATE_KEY
 
 Without the secret the route does not exist. Keep the secret as safe as your key: it can change your stored vouchers.
 
+Or let a second Worker close on a timer: `examples/worker-closer/` runs every 15 minutes, closes the channels whose buyer asked to close (the challenge period of the Fuji contract is 86400 seconds) and those whose stored amount reached `MIN_AMOUNT`. That Worker holds the seller key as a secret: use a key that only receives earnings. Each run stays within `MAX_SUBREQUESTS` (45, below the 50 of the free plan) and waits `WAIT_SECONDS` (30) per transaction; what does not fit is closed by a later run, and a run that is cut off is finished by the next one.
+
 ## Store
 
-One store per `payTo` address, shared by everything that takes per-call or monthly payments for it. This is not optional: with two stores, if the first gate's settlement times out although it went through and the second gate's settlement of the same payment is answered with a success, both serve it, and the kit cannot see that. One store per seller and contract set, shared by all instances, and never reset while channels are open or tokens are valid: with an empty store, vouchers and tokens already used count as new.
+One store per `payTo` address, shared by everything that takes per-call or monthly payments for it. This is required. A payment can be sent to two gates; it is settled once on chain, and only a shared store lets the gates see that it is the same payment. With two stores both gates may serve it, for example when one gate's settlement answer is lost or slow while the other one's settles it. Nothing in the kit (the block check included) can tell these apart.
 
 Prepaid vouchers and monthly quotas are counted in a store. It needs three methods:
 
@@ -108,7 +110,7 @@ If the store cannot be reached, or the file lock is not free within 10 seconds, 
 - Selling per call from several instances: pass a shared `store`. With one process, `singleInstance: true` silences the warning.
 - Deposits below `minDepositAtomic` (default: ten calls) are refused. Prepaid is not available on mainnet.
 - A custom store may drop values whose `expiresAt` (unix seconds) has passed if their key starts with `payment:`, and must drop nothing else.
-- `--only-requested` closes only channels whose buyer asked to close; run it on a timer well inside the challenge period. `MIN_AMOUNT` skips small ones otherwise.
+- `--only-requested` closes only channels whose buyer asked to close, plus, when `MIN_AMOUNT` is set, those that reached it; run it on a timer well inside the challenge period. Without `--only-requested`, `MIN_AMOUNT` skips small ones.
 
 Upgrade the gates and `api-seller-close` together, and stop the old ones first. A close that 0.2.1 left unfinished is finished by the next `api-seller-close`; until then that channel takes no calls.
 
@@ -129,6 +131,7 @@ Stop all 0.2.0 processes before starting 0.2.1 on the same store. Records are no
 - `examples/node-server.mjs`: a Node server.
 - `examples/worker/`: a Cloudflare Worker.
 - `examples/worker-prepaid/`: a Cloudflare Worker with prepaid, closed from your own machine.
+- `examples/worker-closer/`: a Cloudflare Worker that closes those channels on a timer.
 
 ## Notes
 
@@ -143,7 +146,7 @@ Stop all 0.2.0 processes before starting 0.2.1 on the same store. Records are no
   | `settled` | 200, 409, 502 | it was settled; do not pay again. With 502 the reply is still owed: repeat the same request |
   | `refused` | 402, 413, 502 | this request settled nothing; safe to pay unless the same payment was sent before |
 
-- Set `settlementRpcUrl` (an RPC of the same chain; prepaid's `rpcUrl` is used otherwise). Monthly always has one: on Fuji and Base Sepolia a public RPC is the default; elsewhere you must name it. The RPC is asked for the current block before every settlement (two short requests at most) and when a payment is unclear. Payments that fail verification cause at most ten lookups a minute at the public default; beyond that they are answered `refused` without one. If the block cannot be read before a settlement whose answer is then lost, that payment stays `unclear`. With it the gate finds a payment on chain that the facilitator did not confirm, and can tell when an authorization ran out unused. Without it such a payment stays `unclear`.
+- Set `settlementRpcUrl` (an RPC of the same chain; prepaid's `rpcUrl` is used otherwise). Monthly always has one: on Fuji and Base Sepolia a public RPC is the default; elsewhere you must name it. The RPC is asked for the current block before every settlement (two short requests at most) and when a payment is unclear. Payments that fail verification cause at most ten lookups a minute at the public default, counted in each process or Worker isolate. Anybody can use up that allowance with signatures that cost nothing; then such a payment, even one that really was settled, is answered `refused` instead of `unclear` until the minute is over. If the block cannot be read, nothing is settled: the answer is 503 `chain_unavailable`, `not_taken`, and the same payment can be sent again. With it the gate finds a payment on chain that the facilitator did not confirm, and can tell when an authorization ran out unused. Without it such a payment stays `unclear`.
 - One payment gets one reply. Several instances must share a store for that, also when you only sell per call; on Workers the gate refuses to start without one. Instances that do not share a store cannot see each other's payments: if two get the same payment at once and the facilitator answers both with a plain success, both serve it.
 - A buyer who sends `hub-idempotency-key` (32 to 200 random characters, new for every payment) can repeat the same request (method, address and body up to 1 MB) after an unclear payment. If it turns out paid, the API is called for that buyer, once more if the first reply was withheld, and the payment is done. A monthly token is given again at any time. Replies are not stored: one that was sent but got lost cannot be fetched again, and neither can a lost prepaid or monthly call. Without the key nothing can be repeated: a payment's signature is public on chain and proves nothing.
 - Only 2xx replies count. A redirect or an error of your API is passed on and costs nothing. Your API gets the request without the payment headers and without conditional ones (`if-none-match` and the like), and must answer within `upstreamTimeoutMs` (5 minutes).

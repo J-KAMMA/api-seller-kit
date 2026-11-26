@@ -12,6 +12,8 @@ const NOW = 1_000_000;
 const URL_ = "https://api.example/echo";
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
 
+/** The public testnet RPCs a monthly gate asks for the block before it settles: a chain that answers. */
+export const fakeRpc = (url, init) => (/avax-test|sepolia.base/.test(String(url)) ? Response.json({ jsonrpc: "2.0", id: 1, result: JSON.parse(init.body).method === "eth_chainId" ? (String(url).includes("base") ? "0x14a34" : "0xa869") : "0x64" }) : null);
 const base = {
   network: "eip155:43113",
   asset: USDC,
@@ -21,7 +23,7 @@ const base = {
   facilitatorUrl: "https://facilitator.example",
   resource: URL_,
   now: () => NOW,
-  fetch: async (url) => new Response(JSON.stringify(new URL(url).pathname === "/verify" ? { isValid: true } : { success: true, transaction: "0xabc" })),
+  fetch: async (url, init) => fakeRpc(url, init) ?? new Response(JSON.stringify(new URL(url).pathname === "/verify" ? { isValid: true } : { success: true, transaction: "0xabc" })),
 };
 export const BUYER = buyer.address;
 export const channelGate = (store, { contract = A("c"), network = base.network, prepaid = {}, ...extra } = {}) =>

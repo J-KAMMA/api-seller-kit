@@ -5,7 +5,7 @@ import { closeChannels } from "../src/close.mjs";
 import { createX402Gate } from "../src/index.mjs";
 import { createFileStore, createMemoryStore } from "../src/store.mjs";
 import { signToken } from "../src/subscription.mjs";
-import { A, BUYER, CHANNEL_ID, channelGate, useVoucher, voucher } from "./fixtures/gates.mjs";
+import { A, BUYER, CHANNEL_ID, fakeRpc, channelGate, useVoucher, voucher } from "./fixtures/gates.mjs";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,7 +29,9 @@ function setup({ settle = async () => ({ success: true, transaction: "0xabc" }),
   const gate = createX402Gate({
     network: "eip155:43113", asset: USDC, payTo: A("2"), seller: A("3"), priceAtomic: "10000", facilitatorUrl: "https://facilitator.example", resource: "https://api.example/echo", store,
     ...(monthly ? { monthly: { priceAtomic: "50000", quota: 5, subscriptionSecret: SECRET, ...monthly } } : {}),
-    fetch: async (url) => {
+    fetch: async (url, init) => {
+      const chain = fakeRpc(url, init);
+      if (chain) return chain;
       if (url.endsWith("/verify")) return (count.verify++, await sleep(2), Response.json({ isValid: true }));
       const r = await settle(++count.settle);
       return r instanceof Response ? r : Response.json(r);
