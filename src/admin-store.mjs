@@ -9,7 +9,7 @@ export const ADMIN_PATH = "/__seller-store";
 const HEADER = "x-seller-admin";
 const MIN_SECRET = 32;
 const MAX_BODY = 1024 * 1024;
-const KEY = /^channels?(:\d{1,12}:0x[0-9a-f]{40})?(:0x[0-9a-f]{64})?$/;
+const KEY = /^(channels?(:\d{1,12}:0x[0-9a-f]{40})?(:0x[0-9a-f]{64})?|closer:\d{1,12}:0x[0-9a-f]{40})$/; // channel records, and a closer's own state
 
 async function digest(text) {
   const subtle = globalThis.crypto?.subtle ?? (await import("node:crypto")).webcrypto.subtle;

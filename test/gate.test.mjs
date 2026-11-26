@@ -51,7 +51,8 @@ test("no payment header -> 402 quote with exact shape", async () => {
   assert.equal(a.resource, cfg.resource);
   assert.equal(a.mimeType, "application/json");
   assert.equal(a.maxTimeoutSeconds, 300);
-  assert.deepEqual(a.extra, { name: "USD Coin", version: "2", seller: A("3") });
+  assert.deepEqual(a.extra, { name: "USD Coin", version: "2", seller: A("3"), gateBinding: { v: 1, gateId: a.extra.gateBinding.gateId, required: false } });
+  assert.match(a.extra.gateBinding.gateId, /^0x[0-9a-f]{64}$/);
   const fromHeader = JSON.parse(Buffer.from(res.headers.get("payment-required"), "base64").toString());
   assert.deepEqual(fromHeader, body);
 });

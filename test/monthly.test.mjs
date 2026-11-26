@@ -55,7 +55,8 @@ test("402 quote carries the monthly exact entry with the exact shape", async () 
   assert.equal(m.amount, "5000000");
   assert.equal(m.maxAmountRequired, "5000000");
   assert.equal(m.payTo, A("2"));
-  assert.deepEqual(m.extra, { name: "USD Coin", version: "2", seller: A("3"), plan: "monthly", periodDays: 30, quota: null });
+  assert.deepEqual(m.extra, { name: "USD Coin", version: "2", seller: A("3"), gateBinding: m.extra.gateBinding, plan: "monthly", periodDays: 30, quota: null });
+  assert.equal(m.extra.gateBinding.gateId, body.accepts[0].extra.gateBinding.gateId);
 });
 
 test("monthly purchase settles at the monthly price and returns a spec-shaped token", async () => {
@@ -66,7 +67,8 @@ test("monthly purchase settles at the monthly price and returns a spec-shaped to
   const token = res.headers.get("hub-subscription");
   const [part, sig] = token.split(".");
   const payload = JSON.parse(Buffer.from(part, "base64url").toString());
-  assert.deepEqual(payload, { v: 2, seller: A("3"), buyer: BUYER, resource: "https://api.example", path: "/echo", price: "5000000", network: "eip155:43113", expiresAt: 1_000_000 + 30 * 86400, quota: 2, payment: payload.payment });
+  assert.deepEqual(payload, { v: 2, seller: A("3"), buyer: BUYER, resource: "https://api.example", path: "/echo", price: "5000000", network: "eip155:43113", expiresAt: 1_000_000 + 30 * 86400, quota: 2, payment: payload.payment, gate: payload.gate });
+  assert.match(payload.gate, /^0x[0-9a-f]{64}$/); // the gate it was bought at
   assert.match(payload.payment, /^[0-9a-f]{32}$/);
   assert.equal(sig, createHmac("sha256", SECRET).update(part).digest("base64url"));
 });

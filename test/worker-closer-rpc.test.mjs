@@ -94,8 +94,9 @@ test("every channel whose buyer asked is closed within as many runs as there are
     assert.equal(w.closed.size, n, `n=${n} after ${runs} runs`);
     assert.ok(runs <= n, `n=${n}: ${runs} runs`);
     for (const amount of w.closed.values()) assert.equal(amount, 20000n); // exactly the served calls
-    assert.deepEqual([...w.closed.keys()].slice(0, Math.min(n, 3)), [...w.ids].reverse().slice(0, Math.min(n, 3)));
-    assert.ok(Math.max(...w.perRun) <= 45, `n=${n}: ${w.perRun}`);
+    // the oldest request first among the 20 read in a run (30 channels: read in turn, 20 and then 10)
+    if (n <= 20) assert.deepEqual([...w.closed.keys()].slice(0, Math.min(n, 3)), [...w.ids].reverse().slice(0, Math.min(n, 3)));
+    assert.ok(Math.max(...w.perRun) <= 48, `n=${n}: ${w.perRun}`);
   }
 });
 
@@ -104,19 +105,19 @@ test("channels nobody asked to close do not keep the asked ones waiting", { time
   for (let run = 0; run < 3; run++) await w.run();
   assert.equal(w.perRun.length, 3); // one requested channel per run
   assert.deepEqual([...w.closed.keys()], [w.ids[2], w.ids[1], w.ids[0]]); // the oldest request first, nobody else
-  assert.ok(Math.max(...w.perRun) <= 45);
+  assert.ok(Math.max(...w.perRun) <= 48);
 });
 
-test("a close that is not mined in time stays within the budget, and the next run does not send it twice", { timeout: 120_000 }, async () => {
+test("a close that is not mined in time stays within the budget, and the next run does not send it twice", { timeout: 400_000 }, async () => {
   const w = await world(2, { mines: false });
   for (let i = 0; i < 3; i++) await w.run({ WAIT_SECONDS: "30" });
-  assert.ok(Math.max(...w.perRun) <= 45, String(w.perRun));
-  for (const budget of ["36", "100"]) {
+  assert.ok(Math.max(...w.perRun) <= 48, String(w.perRun));
+  for (const budget of ["46", "100"]) {
     const v = await world(1, { mines: false });
     await v.run({ MAX_SUBREQUESTS: budget, WAIT_SECONDS: "60" });
     assert.ok(v.perRun[0] <= Number(budget), `${budget}: ${v.perRun}`);
   }
-  await assert.rejects(runCloser({ ...ENV, MAX_SUBREQUESTS: "35" }), /MAX_SUBREQUESTS/);
+  await assert.rejects(runCloser({ ...ENV, MAX_SUBREQUESTS: "45" }), /MAX_SUBREQUESTS/);
 });
 
 test("the log names no address and no request", async () => {
@@ -141,5 +142,5 @@ test("channels that reached the minimum are all reached too, also while the inde
   const w = await world(10, { requested: 0, calls: 2 });
   for (let run = 0; run < 12 && w.closed.size < 10; run++) await w.run({ MIN_AMOUNT: "20000" });
   assert.equal(w.closed.size, 10);
-  assert.ok(Math.max(...w.perRun) <= 45);
+  assert.ok(Math.max(...w.perRun) <= 48);
 });

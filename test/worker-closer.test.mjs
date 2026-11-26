@@ -66,7 +66,7 @@ test("a run within its budget leaves the rest to the next one; a run cut off any
   let runs = 0;
   while (w.sent.length < 4) {
     const before = w.requests;
-    const out = await w.run({ MAX_SUBREQUESTS: "45", WAIT_SECONDS: "5" });
+    const out = await w.run({ MAX_SUBREQUESTS: "46", WAIT_SECONDS: "5" });
     assert.ok(w.requests - before <= 45, String(w.requests - before));
     assert.ok(out.closed.length >= 1);
     assert.ok(++runs < 6);

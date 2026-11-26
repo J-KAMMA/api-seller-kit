@@ -61,7 +61,10 @@ export async function verifyToken(secret, token) {
 
 /**
  * @param {{ seller: string, network: string, monthly: { quota: number|null, subscriptionSecret: string },
- *           store: { get(k:string):any, compareAndSet(k:string,expected:any,next:any):any }, now?: () => number, resource: string }} o
+ *           store: { get(k:string):any, compareAndSet(k:string,expected:any,next:any):any }, now?: () => number, resource: string,
+ *           gateId?: string, requireBinding?: boolean }} o
+ * A token names the gate it was bought at (gateId) and is refused at every other one, so that its quota is counted once. Tokens
+ * issued before 0.4.1 name none: they are accepted only where binding is not required, and run out within 30 days.
  */
 export function createSubscriptions(o) {
   const { monthly, store } = o;
@@ -92,6 +95,7 @@ export function createSubscriptions(o) {
         expiresAt: issuedAt + PERIOD_DAYS * 86400,
         quota: monthly.quota ?? null,
         payment,
+        ...(o.gateId ? { gate: o.gateId } : {}),
       });
       await casUpdate(store, `quota:${token.split(".")[1]}`, (rec) => (rec === null ? { next: { count: 1 } } : {}));
       return token;
@@ -109,6 +113,7 @@ export function createSubscriptions(o) {
         if (!prices.includes(p.price)) return { ok: false, error: "subscription_wrong_plan" };
       } else if (p.quota !== (monthly.quota ?? null)) return { ok: false, error: "subscription_wrong_plan" }; // issued before 0.3.0 (runs out within 30 days): at least the same quota
       if (p.resource !== origin) return { ok: false, error: "subscription_wrong_resource" };
+      if (p.gate === undefined ? o.requireBinding === true : p.gate !== o.gateId) return { ok: false, error: "subscription_wrong_gate" };
       if (!Number.isInteger(p.expiresAt) || p.expiresAt <= now()) return { ok: false, error: "subscription_expired" };
       if (!(p.quota === null || (Number.isInteger(p.quota) && p.quota > 0))) return { ok: false, error: "subscription_invalid" };
       // the signed quota is the authority; the counter lives in the store

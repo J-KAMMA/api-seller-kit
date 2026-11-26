@@ -2,6 +2,7 @@
 // Flow: no payment -> 402 quote; payment -> facilitator /verify -> upstream -> (2xx only) /settle -> reply.
 // Fail closed: any verify/settle problem means the body is never returned. The payment payload is never logged.
 // Optional modes (PREPAID-MONTHLY.md): `prepaid` (hub-channel voucher) and `monthly` (hub-subscription token).
+import { bindingOf, gateIdOf } from "./gate-binding.mjs";
 import { createSubscriptions } from "./subscription.mjs";
 import { ATTEMPT_MS, BodyTooLarge, createPayments, IDEMPOTENCY_HEADER, ownerDigest, paymentId, requestDigest, sha256Hex } from "./payments.mjs";
 import { createSettlementProof } from "./settlement-proof.mjs";
@@ -19,7 +20,7 @@ import { createFileStore, createMemoryStore, isAtomicStore, isProcessLocal, sing
  *   prepaid?: { pricePerCallAtomic: string|number|bigint, channelContract: string, minDepositAtomic?: string|number|bigint, rpcUrl?: string, readChannel?: Function, earlierContracts?: string[], callTimeoutMs?: number },
  *   monthly?: { priceAtomic: string|number|bigint, quota: number|null, subscriptionSecret: string, acceptPrices?: (string|number|bigint)[] },
  *   store?: { get(key: string): any, set(key: string, value: any): any, compareAndSet?(key: string, expected: any, next: any): any },
- *   singleInstance?: boolean, upstreamTimeoutMs?: number, settlementRpcUrl?: string, storePath?: string, now?: () => number
+ *   singleInstance?: boolean, gateId?: string, requireGateBinding?: boolean, upstreamTimeoutMs?: number, settlementRpcUrl?: string, storePath?: string, now?: () => number
  * }} GateConfig */
 
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -68,7 +69,7 @@ function snapshot(given) {
   const c = take(
     given,
     ["network", "asset", "payTo", "seller", "priceAtomic", "facilitatorUrl", "description", "resource", "mimeType", "maxTimeoutSeconds", "tokenName", "tokenVersion",
-      "allowLocalDevNetwork", "singleInstance", "upstreamTimeoutMs", "settlementRpcUrl", "storePath"],
+      "allowLocalDevNetwork", "singleInstance", "upstreamTimeoutMs", "settlementRpcUrl", "storePath", "gateId", "requireGateBinding"],
     ["allowedNetworks"],
     ["fetch", "now", "store", "facilitatorHeaders", "prepaid", "monthly"],
   );
@@ -90,6 +91,8 @@ function assertConfig(c) {
   if (c.allowLocalDevNetwork === true) known.push(LOCAL_DEV_NETWORK);
   if (c.allowedNetworks !== undefined && !Array.isArray(c.allowedNetworks)) bad("allowedNetworks must be a list");
   const allowed = c.allowedNetworks === undefined ? known : known.filter((n) => c.allowedNetworks.includes(n));
+  if (c.gateId !== undefined && !(typeof c.gateId === "string" && c.gateId.length > 0 && c.gateId.length <= 200)) bad("gateId must be a text of 1 to 200 characters");
+  if (c.requireGateBinding !== undefined && typeof c.requireGateBinding !== "boolean") bad("requireGateBinding must be true or false");
   if (!NETWORK.test(c.network) || !allowed.includes(c.network)) bad(`network must be one of ${allowed.join(", ")}`);
   for (const k of ["asset", "payTo", "seller"]) if (!ADDRESS.test(String(c[k]))) bad(`${k} must be a 0x address`);
   if (!/^[1-9]\d{0,29}$/.test(String(c.priceAtomic))) bad("priceAtomic must be a positive integer (atomic units)");
@@ -149,6 +152,8 @@ function assertConfig(c) {
     if (!/^https?:$/.test(resource.protocol)) bad("resource must be an http(s) address");
     if (typeof m.subscriptionSecret !== "string" || m.subscriptionSecret.length < 16) bad("monthly.subscriptionSecret must be a string of 16+ characters");
   }
+  // Without them the gate's id comes from payTo alone, and every such gate on that payTo would accept the others' bound payments.
+  if (c.requireGateBinding === true && c.gateId === undefined && c.resource === undefined) bad("binding needs gateId or resource, so that this gate's id is its own");
 }
 
 /**
@@ -183,7 +188,10 @@ export function createX402Gate(given) {
   if ((!store || (config.store && !isAtomicStore(config.store))) && config.singleInstance !== true) {
     console.warn("x402 gate: payments are remembered by this process only; pass a store with compareAndSet when several instances run, or singleInstance: true");
   }
-  const subs = config.monthly ? createSubscriptions({ seller: config.seller, network: config.network, monthly: config.monthly, store, now: config.now, resource: config.resource }) : null;
+  const thisGateId = gateIdOf(config);
+  const requireBinding = config.requireGateBinding === true;
+  if (config.gateId === undefined && config.resource === undefined) console.warn("x402 gate: no gateId and no resource: every such gate on this payTo has the same id; give each gate its own gateId");
+  const subs = config.monthly ? createSubscriptions({ seller: config.seller, network: config.network, monthly: config.monthly, store, now: config.now, resource: config.resource, gateId: thisGateId, requireBinding }) : null;
   // A month that was paid must be collectable whatever the facilitator answers, so monthly always has an RPC. The public default is asked
   // for the block before every settlement, and when something is unclear.
   const namedRpc = config.settlementRpcUrl ?? (config.prepaid?.rpcUrl || undefined);
@@ -199,6 +207,7 @@ export function createX402Gate(given) {
     looks = looks.filter((t) => now - t < 60_000);
     return looks.length < MAX_PUBLIC_LOOKS && looks.push(now) > 0;
   };
+  const thisGate = { chainId: Number(config.network.split(":")[1]), asset: config.asset.toLowerCase(), payTo: config.payTo.toLowerCase(), gateId: thisGateId };
   const upstreamTimeout = config.upstreamTimeoutMs ?? 300_000;
   const payments = createPayments(store ?? createMemoryStore(), upstreamTimeout);
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
@@ -250,6 +259,7 @@ export function createX402Gate(given) {
         name: config.tokenName ?? (config.network === "eip155:84532" ? "USDC" : "USD Coin"), // EIP-712 domain name on chain: Fuji USDC is "USD Coin", Base Sepolia is "USDC"
         version: config.tokenVersion ?? "2",
         seller: config.seller.toLowerCase(),
+        gateBinding: { v: 1, gateId: thisGate.gateId, required: requireBinding }, // see gate-binding.mjs
       },
     };
   }
@@ -431,6 +441,14 @@ export function createX402Gate(given) {
       return quote(request, "payment_header_invalid");
     }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return quote(request, "payment_header_invalid");
+    // Made for another gate (or bound wrongly): this gate never serves it, whatever its store says. Unbound: only where allowed.
+    const binding = bindingOf(payload, thisGate);
+    if (binding === "foreign") return quote(request, "payment_for_another_gate", undefined, "refused");
+    if (binding === "unbound" && requireBinding) return quote(request, "payment_not_bound", undefined, "refused");
+    if (binding === "bound") {
+      const { binding: _proof, ...forwarded } = payload; // the facilitator gets the standard payload
+      payload = forwarded;
+    }
 
     // Both requirement sets come from config; the buyer's hint only picks one and the facilitator verifies against it.
     const isMonthly = config.monthly !== undefined && payload.accepted?.extra?.plan === "monthly";

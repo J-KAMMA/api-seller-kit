@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1 (2026-11-26)
+
+- Closing Worker: it remembers, in the seller's store (key `closer:<chain>:<contract>`, allowed by the admin route), the channels whose buyer asked to close and when their window ends. It closes the one whose window ends soonest, drops those whose window is over, and reads the index 20 channels a run in turn, so the budget no longer grows with the index. Channels closed on chain or past their window leave the index; their records stay. The default `MAX_SUBREQUESTS` is now 48 (the free plan allows 50) and it must be at least 46: a run reads, closes and remembers within that.
+- Closing Worker: a refused or partial batch read is retried one by one where the budget allows, and logged as `batch_refused`; `index_too_large_for_budget` when a full turn through the index takes three quarters of the challenge period. After a refused batch it reads one by one in later runs too, and never passes over a channel it could not read.
+- Upgrade the seller Worker too: its admin route has to allow the closer's key.
+- Gate binding: where binding is required (mainnet, or `requireGateBinding: true`) a gate without `gateId` and `resource` refuses to start, since its id would come from `payTo` alone; elsewhere it warns. README: the same `gateId` means one shared store, and the binding guarantee holds only when every gate on that `payTo` requires binding.
+- Monthly: a token names the gate it was bought at (`gate`) and is refused at every other one (`subscription_wrong_gate`), so a shared `subscriptionSecret` no longer doubles the quota. Tokens without it (before 0.4.1) are accepted only where binding is not required.
+- Tests: `gate-binding-replay`, `gate-binding-scope` and `worker-closer-scale` run in `npm test`.
+
+## 0.4.0 (2026-11-26)
+
+- Payments bound to one gate: the quote carries `extra.gateBinding` (`gateId`); a payment whose nonce was derived from another gate's id is refused before anything is settled. `gateId` (default from `resource` and `payTo`), `requireGateBinding` (off by default on testnets, always on for mainnet). The buyer rule is in `src/gate-binding.mjs`.
+- Gates of one seller and contract must share a store for prepaid (documented; vouchers cannot carry a gate).
+
 ## 0.3.4 (2026-11-26)
 
 - Closing Worker: with several channels a run spent its budget on looking and closed nothing. It now takes one channel after the other, starting one further on at every run, and looks at a channel only while a close still fits; the wait for a receipt also stops at the budget. `MAX_SUBREQUESTS` must be at least 36.
