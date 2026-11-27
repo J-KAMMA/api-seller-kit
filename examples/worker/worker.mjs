@@ -19,6 +19,7 @@ function gateFor(env, origin) {
     payTo: env.PAY_TO,
     priceAtomic: env.PRICE_ATOMIC ?? "10000",
     facilitatorUrl: env.FACILITATOR_URL,
+    direct: env.DIRECT === "true", // the buyer sends the payment and pays its gas (hub-direct)
     settlementRpcUrl: env.RPC_URL ?? "https://api.avax-test.network/ext/bc/C/rpc",
     description: "echo (Hub API market sample, testnet)",
     resource: env.PUBLIC_URL ?? `${origin}/echo`, // 公開の住所を決めて置く（PUBLIC_URL）。呼び出しの Host には従わない
