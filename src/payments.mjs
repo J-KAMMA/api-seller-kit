@@ -21,6 +21,9 @@ const MAX_VALID_SECONDS = 24 * 3600;
 const MARGIN_SECONDS = 3600;
 /** How long a payment that still owes somebody something is remembered: longer than a monthly token lives. */
 const LONG_SECONDS = 31 * 24 * 3600;
+/** hub-direct accepts a transaction up to DIRECT_MAX_AGE_SECONDS old: every paid record is kept longer, so none can be served again. */
+export const DIRECT_MAX_AGE_SECONDS = 3 * 24 * 3600; // longer than a gate is likely to be unreachable or busy
+const PAID_SECONDS = DIRECT_MAX_AGE_SECONDS + 2 * MARGIN_SECONDS;
 /** Longer than an attempt (ATTEMPT_MS) can take. */
 const SETTLING_MS = 180_000;
 export const ATTEMPT_MS = 120_000;
@@ -96,8 +99,8 @@ export function createPayments(store, callMs) {
     isFree: (rec) => rec === null || rec.state === "released" || dead(rec, "running"),
 
     /** { rec } when it is ours now, { existing } otherwise. issuedAt dates the monthly token, whenever it is issued. */
-    claim({ key, expiresAt }, owner, request, issuedAt) {
-      const rec = { state: "running", id: newId(), owner, request, at: Date.now(), issuedAt, expiresAt };
+    claim({ key, expiresAt }, owner, request, issuedAt, extra = {}) {
+      const rec = { ...extra, state: "running", id: newId(), owner, request, at: Date.now(), issuedAt, expiresAt };
       return casUpdate(store, key, (cur) => (this.isFree(cur) ? { next: rec, result: { rec } } : { result: { existing: cur } }));
     },
     release: (key, id) => step(key, id, ["running"], { state: "released", owner: null }),
@@ -108,7 +111,12 @@ export function createPayments(store, callMs) {
     /** The authorization ran out unused: nothing was paid and never will be. */
     void: (key, id) => step(key, id, ["settling"], { state: "void" }),
     /** fields: { token?, transaction } */
-    settled: (key, id, fields) => step(key, id, ["settling", "delivering"], { state: "settled", ...fields, ...(fields.token ? { expiresAt: seconds() + LONG_SECONDS } : {}) }),
+    settled: (key, id, fields) =>
+      casUpdate(store, key, (cur) =>
+        cur?.id === id && ["settling", "delivering"].includes(cur.state)
+          ? { next: { ...cur, at: Date.now(), state: "settled", ...fields, expiresAt: Math.max(Number(cur.expiresAt) || 0, seconds() + (fields.token ? LONG_SECONDS : PAID_SECONDS)) }, result: true }
+          : { result: false },
+      ),
     owed: (key, id, fields) => step(key, id, ["settling", "delivering"], { state: "owed", expiresAt: seconds() + LONG_SECONDS, ...fields }),
 
     /** For the owner's retry: takes an open record for one attempt. null: another attempt is under way. */

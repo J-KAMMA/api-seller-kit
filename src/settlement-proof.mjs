@@ -19,7 +19,7 @@ const same = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
 /** depth: blocks below the head that count as settled. */
 export function createSettlementProof({ rpcUrl, chainId, asset, payTo, doFetch, depth = 0n, budgetMs = BUDGET_MS }) {
   let checked = null;
-  async function rpc(method, params, until = Infinity) {
+  async function rpc(method, params, until = Infinity, maybeNull = false) {
     const left = Math.min(TIMEOUT_MS, until - Date.now());
     if (left <= 0) throw new Error("too_late");
     const controller = new AbortController();
@@ -34,7 +34,7 @@ export function createSettlementProof({ rpcUrl, chainId, asset, payTo, doFetch, 
       });
       const body = await res.json();
       if (body?.error) throw Object.assign(new Error("rpc_refused"), { refused: true });
-      if (!res.ok || body?.result === undefined || body.result === null) throw new Error("rpc_error");
+      if (!res.ok || body?.result === undefined || (body.result === null && !maybeNull)) throw new Error("rpc_error");
       return body.result;
     } finally {
       clearTimeout(timer);
@@ -75,6 +75,41 @@ export function createSettlementProof({ rpcUrl, chainId, asset, payTo, doFetch, 
         return String(BigInt(await rpc("eth_blockNumber", [], until)) + 1n);
       } catch {
         return null;
+      }
+    },
+
+    /**
+     * A payment the buyer sent itself (hub-direct). One transaction, named by the buyer, read from the chain:
+     *   paid       successful, deep enough, in the block the chain still has at that height, not older than maxAgeSeconds, and holding the
+     *              token's AuthorizationUsed(from, nonce) followed by its Transfer(from, payTo, value >= minAmount)
+     *   pending    not found yet, not deep enough, or its block was replaced
+     *   reverted   it failed: this transaction moved nothing (another one may have used the authorization)
+     *   too_old    paid too long ago to be told apart from a payment that was served and forgotten
+     *   not_this_payment  it holds no such payment
+     *   unclear    the chain cannot be read now
+     * Never throws.
+     */
+    async direct({ txHash, from, nonce, minAmount, maxAgeSeconds, now }) {
+      try {
+        const until = Date.now() + 2 * TIMEOUT_MS;
+        await ready(until);
+        const receipt = await rpc("eth_getTransactionReceipt", [txHash], until, true);
+        if (receipt === null) return { state: "pending" };
+        if (!same(receipt.transactionHash, txHash) || !Array.isArray(receipt.logs)) return { state: "unclear" };
+        if (receipt.status !== "0x1") return { state: "reverted" };
+        const at = BigInt(receipt.blockNumber);
+        const top = BigInt(await rpc("eth_blockNumber", [], until));
+        if (top < at + depth) return { state: "pending" };
+        const block = await rpc("eth_getBlockByNumber", [hex(at), false], until, true);
+        if (block === null || !same(block.hash, receipt.blockHash)) return { state: "pending" };
+        if (BigInt(block.timestamp) + BigInt(maxAgeSeconds) < BigInt(now)) return { state: "too_old" };
+        const i = receipt.logs.findIndex((l) => same(l.address, asset) && same(l.topics?.[0], AUTHORIZATION_USED) && same(l.topics?.[1], word(from)) && same(l.topics?.[2], nonce));
+        const paid = i === -1 ? undefined : receipt.logs[i + 1];
+        if (!paid || BigInt(paid.logIndex) !== BigInt(receipt.logs[i].logIndex) + 1n || !same(paid.address, asset) || !same(paid.topics?.[0], TRANSFER) || !same(paid.topics?.[1], word(from)) || !same(paid.topics?.[2], word(payTo))) return { state: "not_this_payment" };
+        if (BigInt(paid.data) < BigInt(minAmount)) return { state: "not_this_payment" };
+        return { state: "paid", transaction: receipt.transactionHash, amount: BigInt(paid.data).toString() };
+      } catch {
+        return { state: "unclear" };
       }
     },
 

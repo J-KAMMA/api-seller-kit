@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.1 (2026-11-27)
+
+- hub-direct: the record keeps the plan, payer and transaction from the moment it is taken. Whoever finishes it, after a store failure or a crash, issues the same monthly token.
+- hub-direct: until one call is answered with a 2xx, the payment pays for any call to this gate on the same plan. A call the API refused or failed does not use it up.
+- hub-direct: lookups are limited per gate and per payer (20 a minute on the public RPC, 600 with `settlementRpcUrl`); when limited the answer is 503 `chain_busy` with `retry-after`. A transaction is accepted for 3 days (was 24 hours), so a busy or unreachable gate does not make an honest payment run out, and paid records are kept a little longer than that.
+- hub-direct: refusals after payment are 422 without `accepts` and `payment-required`; header fields are checked strictly, so arrays and numbers are refused instead of failing.
+- README: one store per `gateId`.
+
+## 0.5.0 (2026-11-27)
+
+- Direct payments (`hub-direct`, testnets): the buyer sends the gate-bound EIP-3009 authorization to the chain itself, with `transferWithAuthorization`, and pays the gas. It then calls the API with `hub-direct-payment: base64({v:1, network, txHash, from, nonce, r, plan?})`. The gate reads the receipt from its RPC, with no facilitator. The receipt must be successful, deep enough, in a block the chain still has at that height, and at most 24 hours old. It must hold the token's `AuthorizationUsed(from, nonce)` followed by `Transfer(from, payTo, value >= price)`. The nonce must be this gate's bound nonce for `r`. The payment is recorded under the same key as an x402 payment, so it is served once, at one gate. `plan: "monthly"` buys the monthly token.
+- `direct` option, off by default. With `direct: true`, `facilitatorUrl` is optional; without one, the quote offers only `hub-direct` (and prepaid) and x402 payment headers are refused. The quote's `hub-direct` entry carries `gateBinding`, `minConfirmations`, `maxAgeSeconds` and the header name. A direct gate needs `gateId` or `resource`, and an atomic store.
+- Answers: not mined, not deep enough or reorganised: 402 `payment_pending` with `retry-after`, never safe to pay again. Reverted: refused, with `payment_in_another_transaction` when the authorization was used by another transaction. Already used: 409. A failed API call keeps the payment owed for the same request.
+- Paid records are now kept at least 26 hours, longer than a direct transaction is accepted, so a transaction settled through a facilitator cannot be served again as `hub-direct`.
+
 ## 0.4.1 (2026-11-26)
 
 - Closing Worker: it remembers, in the seller's store (key `closer:<chain>:<contract>`, allowed by the admin route), the channels whose buyer asked to close and when their window ends. It closes the one whose window ends soonest, drops those whose window is over, and reads the index 20 channels a run in turn, so the budget no longer grows with the index. Channels closed on chain or past their window leave the index; their records stay. The default `MAX_SUBREQUESTS` is now 48 (the free plan allows 50) and it must be at least 46: a run reads, closes and remembers within that.

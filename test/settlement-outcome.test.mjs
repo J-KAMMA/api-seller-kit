@@ -524,7 +524,8 @@ test("records live as long as somebody may need them, and a forgotten one is not
   assert.ok(state === "owed" && left > 30);
   w = world({ mode: "ok" });
   await w.go();
-  assert.ok((await days(w))[1] < 1); // paid and answered: nothing is owed
+  const kept = (await days(w))[1];
+  assert.ok(kept > 3 && kept < 3.2, String(kept)); // paid and answered: nothing is owed, kept longer than a hub-direct transaction is accepted
 
   // no record any more
   const fresh = (o) => {

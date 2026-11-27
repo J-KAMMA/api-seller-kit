@@ -2,9 +2,9 @@
 // Flow: no payment -> 402 quote; payment -> facilitator /verify -> upstream -> (2xx only) /settle -> reply.
 // Fail closed: any verify/settle problem means the body is never returned. The payment payload is never logged.
 // Optional modes (PREPAID-MONTHLY.md): `prepaid` (hub-channel voucher) and `monthly` (hub-subscription token).
-import { bindingOf, gateIdOf } from "./gate-binding.mjs";
+import { bindingOf, boundNonce, gateIdOf } from "./gate-binding.mjs";
 import { createSubscriptions } from "./subscription.mjs";
-import { ATTEMPT_MS, BodyTooLarge, createPayments, IDEMPOTENCY_HEADER, ownerDigest, paymentId, requestDigest, sha256Hex } from "./payments.mjs";
+import { ATTEMPT_MS, BodyTooLarge, createPayments, DIRECT_MAX_AGE_SECONDS, IDEMPOTENCY_HEADER, ownerDigest, paymentId, requestDigest, sha256Hex } from "./payments.mjs";
 import { createSettlementProof } from "./settlement-proof.mjs";
 import { classify, decide, reclassify } from "./settlement-table.mjs";
 import { PUBLIC_RPC, settledDepth } from "./networks.mjs";
@@ -13,7 +13,7 @@ import { createFileStore, createMemoryStore, isAtomicStore, isProcessLocal, sing
 
 /** @typedef {{
  *   network: string, asset: string, payTo: string, seller: string, priceAtomic: string|number|bigint,
- *   facilitatorUrl: string, description?: string, resource?: string, mimeType?: string,
+ *   facilitatorUrl?: string, direct?: boolean, description?: string, resource?: string, mimeType?: string,
  *   maxTimeoutSeconds?: number, tokenName?: string, tokenVersion?: string,
  *   facilitatorHeaders?: Record<string,string>, fetch?: typeof fetch, allowedNetworks?: string[],
  *   allowLocalDevNetwork?: boolean,
@@ -39,6 +39,9 @@ const REQUEST_HEADERS = ["payment-signature", "x-payment"];
 const VOUCHER_HEADER = "hub-channel-voucher";
 const SUBSCRIPTION_HEADER = "hub-subscription";
 const RECEIPT_HEADER = "hub-channel-receipt";
+/** A payment the buyer sent to the chain itself, paying its gas (hub-direct): see direct payments in README. */
+const DIRECT_HEADER = "hub-direct-payment";
+const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 
 function utf8ToBase64(text) {
   const bytes = new TextEncoder().encode(text);
@@ -69,7 +72,7 @@ function snapshot(given) {
   const c = take(
     given,
     ["network", "asset", "payTo", "seller", "priceAtomic", "facilitatorUrl", "description", "resource", "mimeType", "maxTimeoutSeconds", "tokenName", "tokenVersion",
-      "allowLocalDevNetwork", "singleInstance", "upstreamTimeoutMs", "settlementRpcUrl", "storePath", "gateId", "requireGateBinding"],
+      "allowLocalDevNetwork", "direct", "singleInstance", "upstreamTimeoutMs", "settlementRpcUrl", "storePath", "gateId", "requireGateBinding"],
     ["allowedNetworks"],
     ["fetch", "now", "store", "facilitatorHeaders", "prepaid", "monthly"],
   );
@@ -96,15 +99,21 @@ function assertConfig(c) {
   if (!NETWORK.test(c.network) || !allowed.includes(c.network)) bad(`network must be one of ${allowed.join(", ")}`);
   for (const k of ["asset", "payTo", "seller"]) if (!ADDRESS.test(String(c[k]))) bad(`${k} must be a 0x address`);
   if (!/^[1-9]\d{0,29}$/.test(String(c.priceAtomic))) bad("priceAtomic must be a positive integer (atomic units)");
-  let url;
-  try {
-    url = new URL(c.facilitatorUrl);
-  } catch {
-    bad("facilitatorUrl invalid");
+  if (c.direct !== undefined && typeof c.direct !== "boolean") bad("direct must be true or false");
+  const direct = c.direct === true;
+  // With direct payments only, no facilitator is asked at all: the buyer sends the payment and pays its gas.
+  if (c.facilitatorUrl !== undefined || !direct) {
+    let url;
+    try {
+      url = new URL(c.facilitatorUrl);
+    } catch {
+      bad("facilitatorUrl invalid");
+    }
+    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) bad("facilitatorUrl must be https");
+    if (c.network === LOCAL_DEV_NETWORK && !local) bad("local dev network needs a loopback facilitatorUrl");
   }
-  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) bad("facilitatorUrl must be https");
-  if (c.network === LOCAL_DEV_NETWORK && !local) bad("local dev network needs a loopback facilitatorUrl");
+  if (direct && !c.settlementRpcUrl && !c.prepaid?.rpcUrl && !Object.hasOwn(PUBLIC_RPC, c.network)) bad("direct payments on this network need settlementRpcUrl");
   if (c.upstreamTimeoutMs !== undefined && !(Number.isInteger(c.upstreamTimeoutMs) && c.upstreamTimeoutMs > 0)) bad("upstreamTimeoutMs must be a positive integer");
   if (c.settlementRpcUrl !== undefined) {
     let rpc;
@@ -153,7 +162,7 @@ function assertConfig(c) {
     if (typeof m.subscriptionSecret !== "string" || m.subscriptionSecret.length < 16) bad("monthly.subscriptionSecret must be a string of 16+ characters");
   }
   // Without them the gate's id comes from payTo alone, and every such gate on that payTo would accept the others' bound payments.
-  if (c.requireGateBinding === true && c.gateId === undefined && c.resource === undefined) bad("binding needs gateId or resource, so that this gate's id is its own");
+  if ((c.requireGateBinding === true || c.direct === true) && c.gateId === undefined && c.resource === undefined) bad("binding needs gateId or resource, so that this gate's id is its own");
 }
 
 /**
@@ -163,17 +172,18 @@ function assertConfig(c) {
 export function createX402Gate(given) {
   const config = snapshot(given);
   assertConfig(config);
+  const direct = config.direct === true; // off unless asked for
   const doFetch = config.fetch ?? ((input, init) => globalThis.fetch(input, init)); // Workers: keep fetch bound
-  const base = config.facilitatorUrl.replace(/\/+$/, "");
+  const base = config.facilitatorUrl && config.facilitatorUrl.replace(/\/+$/, "");
   const price = String(config.priceAtomic);
   const timeout = config.maxTimeoutSeconds ?? 300;
   let store = null;
-  if (config.prepaid || config.monthly) {
+  if (config.prepaid || config.monthly || direct) {
     store = config.store ?? createFileStore(config.storePath ?? "./seller-kit-store.json");
-    const counts = config.prepaid !== undefined || config.monthly.quota !== null;
+    const counts = direct || config.prepaid !== undefined || config.monthly.quota !== null;
     if (counts && !isAtomicStore(store) && config.singleInstance !== true) {
       throw new Error(
-        "x402 gate config: prepaid and monthly with a quota need a store with compareAndSet(key, expected, next); " +
+        "x402 gate config: direct payments, prepaid and monthly with a quota need a store with compareAndSet(key, expected, next); " +
           "pass singleInstance: true only when exactly one process uses this store",
       );
     }
@@ -195,8 +205,18 @@ export function createX402Gate(given) {
   // A month that was paid must be collectable whatever the facilitator answers, so monthly always has an RPC. The public default is asked
   // for the block before every settlement, and when something is unclear.
   const namedRpc = config.settlementRpcUrl ?? (config.prepaid?.rpcUrl || undefined);
-  const proofRpc = namedRpc ?? (config.monthly ? PUBLIC_RPC[config.network] : undefined);
+  const proofRpc = namedRpc ?? (config.monthly || direct ? PUBLIC_RPC[config.network] : undefined);
   const proof = proofRpc ? createSettlementProof({ rpcUrl: proofRpc, chainId: Number(config.network.split(":")[1]), asset: config.asset, payTo: config.payTo, doFetch, depth: settledDepth(config.network) }) : null;
+  /** hub-direct lookups: a few a minute on the public RPC, more on the seller's own; never most of them for one payer. */
+  const directLimit = namedRpc ? 600 : 20;
+  let directLooks = [];
+  const mayLookDirect = (from) => {
+    const t = Date.now();
+    directLooks = directLooks.filter((x) => t - x.t < 60_000);
+    if (directLooks.length >= directLimit || directLooks.filter((x) => x.from === from).length >= Math.max(5, directLimit / 4)) return false;
+    directLooks.push({ t, from });
+    return true;
+  };
   /** Lookups for payments that failed /verify cost their sender nothing, so the public default RPC gets only a few of them. */
   let looks = [];
   const mayLook = (payload, verified) => {
@@ -223,6 +243,31 @@ export function createX402Gate(given) {
     const req = exactRequirements(request, amount);
     if (monthly) req.extra = { ...req.extra, plan: "monthly", periodDays: 30, quota: config.monthly.quota ?? null };
     return req;
+  }
+
+  /** hub-direct: the same EIP-3009 authorization, with this gate's bound nonce, sent to the chain by the buyer. */
+  function directEntry(request, monthly = false) {
+    const amount = monthly ? String(config.monthly.priceAtomic) : price;
+    const exact = exactRequirements(request, amount);
+    return {
+      scheme: "hub-direct",
+      network: config.network,
+      amount,
+      asset: exact.asset,
+      payTo: exact.payTo,
+      resource: exact.resource,
+      maxTimeoutSeconds: timeout,
+      extra: {
+        name: exact.extra.name,
+        version: exact.extra.version,
+        seller: exact.extra.seller,
+        gateBinding: { v: 1, gateId: thisGate.gateId, required: true },
+        minConfirmations: Number(settledDepth(config.network)) + 1,
+        maxAgeSeconds: DIRECT_MAX_AGE_SECONDS,
+        header: DIRECT_HEADER,
+        ...(monthly ? { plan: "monthly", periodDays: 30, quota: config.monthly.quota ?? null } : {}),
+      },
+    };
   }
 
   function channelEntry(request) {
@@ -282,9 +327,11 @@ export function createX402Gate(given) {
   const failed = (status, error, payment, headers = {}) => json(status, { error, ...outcome(payment) }, { "hub-payment-status": payment, ...headers });
 
   function quote(request, error, extra, payment) {
-    const accepts = [requirements(request)];
+    const accepts = base ? [requirements(request)] : [];
+    if (direct) accepts.push(directEntry(request));
     if (config.prepaid) accepts.push(channelEntry(request));
-    if (config.monthly) accepts.push(requirements(request, true));
+    if (config.monthly && base) accepts.push(requirements(request, true));
+    if (config.monthly && direct) accepts.push(directEntry(request, true));
     const body = { x402Version: 2, accepts };
     if (error) body.error = error;
     if (extra) body.channel = extra;
@@ -317,7 +364,7 @@ export function createX402Gate(given) {
   /** The seller's API: without the payment headers, with a time limit that also covers reading the body, and never more than the cap. */
   async function callUpstream(request, next) {
     const headers = new Headers(request.headers);
-    for (const name of [...REQUEST_HEADERS, VOUCHER_HEADER, SUBSCRIPTION_HEADER, IDEMPOTENCY_HEADER]) headers.delete(name);
+    for (const name of [...REQUEST_HEADERS, VOUCHER_HEADER, SUBSCRIPTION_HEADER, IDEMPOTENCY_HEADER, DIRECT_HEADER]) headers.delete(name);
     // A conditional request could be answered with an uncounted 304 that tells the buyer what they came for.
     for (const name of ["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range"]) headers.delete(name);
     const controller = new AbortController();
@@ -396,6 +443,117 @@ export function createX402Gate(given) {
     return reply(r.upstream, r.bytes, r.headers);
   }
 
+  /**
+   * hub-direct: the buyer sent the payment to the chain itself and paid its gas; no facilitator is asked. The header names the transaction
+   * and the r of the gate-bound nonce. r is the buyer's secret until this call (the chain shows only the nonce), so it also proves the
+   * buyer on a retry. The payment is the same record as an x402 one (network, asset, from, nonce): it is served once, at one gate.
+   * The record keeps what is needed to finish it (plan, payer, transaction), so whoever takes it over issues the same token.
+   * Until one call was answered with 2xx, the payment pays for any call to this gate with the same plan.
+   */
+  async function directPayment(request, next, header) {
+    // After paying, no answer is a 402: a plain x402 client would pay again.
+    const refused = (error) => failed(422, error, "refused");
+    if (header.length > MAX_PAYMENT_HEADER) return refused("payment_header_too_large");
+    let p;
+    try {
+      p = JSON.parse(base64ToUtf8(header));
+    } catch {
+      return refused("payment_header_invalid");
+    }
+    const hex32 = (v) => typeof v === "string" && HEX32.test(v);
+    if (!p || typeof p !== "object" || Array.isArray(p) || p.v !== 1 || !hex32(p.txHash) || !(typeof p.from === "string" && ADDRESS.test(p.from)) || !hex32(p.nonce) || !hex32(p.r)) return refused("payment_header_invalid");
+    if (p.network !== config.network) return refused("payment_wrong_network");
+    if (p.plan !== undefined && !(p.plan === "monthly" && config.monthly)) return refused("payment_plan_unknown");
+    const nonce = p.nonce.toLowerCase();
+    if (boundNonce({ ...thisGate, r: p.r }) !== nonce) return refused("payment_for_another_gate");
+    if (!proof) return failed(503, "chain_unavailable", "unclear", { "retry-after": "10" });
+    const plan = p.plan === "monthly" ? "monthly" : "call";
+    const from = p.from.toLowerCase();
+    const key = `payment:${[config.network, config.asset, from, nonce].join("|").toLowerCase()}`;
+    const owner = await sha256Hex(JSON.stringify([key, "hub-direct", p.r.toLowerCase()]));
+    const paidHeaders = (rec) => ({
+      "hub-payment-status": "settled",
+      ...(rec.receipt ? { "X-PAYMENT-RESPONSE": rec.receipt, "PAYMENT-RESPONSE": rec.receipt } : {}),
+      ...(rec.token ? { [SUBSCRIPTION_HEADER]: rec.token } : {}),
+    });
+    /** What a paid record hands out, from the record alone: the same whoever makes it. */
+    async function fieldsOf(rec) {
+      const d = rec.direct;
+      const fields = { transaction: d.transaction, receipt: utf8ToBase64(JSON.stringify({ success: true, transaction: d.transaction, network: config.network, payer: d.from })) };
+      if (d.plan === "monthly") fields.token = await subs.issue({ buyer: d.from, payment: (await sha256Hex(key)).slice(0, 32), issuedAt: rec.issuedAt });
+      return fields;
+    }
+    /** One call to the API. Anything but a 2xx leaves the payment owed, for this or another call. */
+    async function deliver(rec) {
+      let r;
+      try {
+        r = await callUpstream(request, next);
+      } catch {
+        r = {};
+      }
+      if (!r.bytes) {
+        await payments.owed(key, rec.id, {}).catch(() => {});
+        if (r.upstream && !r.tooLarge) {
+          const headers = new Headers(r.upstream.headers);
+          for (const [k, v] of Object.entries(paidHeaders(rec))) headers.set(k, v);
+          return new Response(r.upstream.body, { status: r.upstream.status, statusText: r.upstream.statusText, headers });
+        }
+        return failed(502, r.tooLarge ? "upstream_too_large" : "upstream_failed", "settled", paidHeaders(rec));
+      }
+      if (!(await payments.settled(key, rec.id, {}).catch(() => false))) return failed(409, "payment_in_progress", "settled");
+      for (const [k, v] of Object.entries(paidHeaders(rec))) r.headers.set(k, v);
+      return reply(r.upstream, r.bytes, r.headers);
+    }
+    /** Owed, or left half way by a process that died or lost the store: take it for one delivery, finishing the record first. */
+    async function deliverOwed() {
+      for (let i = 0; i < 3; i++) {
+        const rec = await payments.retry(key);
+        if (rec === null) return failed(409, "payment_in_progress", "settled");
+        if (rec.state === "delivering" && rec.receipt && (rec.direct.plan !== "monthly" || rec.token)) return deliver(rec);
+        // it was verified on chain before it was taken
+        if (!(await payments.owed(key, rec.id, await fieldsOf(rec)))) return failed(409, "payment_in_progress", "settled");
+      }
+      return failed(409, "payment_in_progress", "settled");
+    }
+
+    try {
+      const rec = await payments.get(key);
+      if (!payments.isFree(rec)) {
+        const status = ["settled", "owed", "delivering", "settling"].includes(rec.state) ? "settled" : "unclear";
+        if (rec.owner !== owner || !rec.direct) return failed(409, "payment_already_used", status); // not this buyer, or paid through a facilitator
+        if (rec.state === "settled") return failed(409, "already_served", "settled", paidHeaders(rec));
+        if (rec.direct.plan !== plan) return failed(409, "payment_for_another_plan", "settled");
+        return await deliverOwed();
+      }
+    } catch {
+      return failed(502, "store_unavailable", "unclear");
+    }
+
+    // Every lookup costs this gate's RPC; a made-up header costs its sender nothing.
+    if (!mayLookDirect(from)) return failed(503, "chain_busy", "unclear", { "retry-after": "20" });
+    const minAmount = plan === "monthly" ? String(config.monthly.priceAtomic) : price;
+    const found = await proof.direct({ txHash: p.txHash, from, nonce, minAmount, maxAgeSeconds: DIRECT_MAX_AGE_SECONDS, now: now() });
+    if (found.state === "pending") return json(402, { error: "payment_pending", ...outcome("unclear") }, { "hub-payment-status": "unclear", "retry-after": "3" });
+    if (found.state === "unclear") return failed(503, "chain_unavailable", "unclear", { "retry-after": "10" });
+    if (found.state === "reverted") {
+      // Somebody else may have sent the same signed authorization first: then the buyer names that transaction.
+      const used = await proof.used({ from, nonce, validBefore: null });
+      return refused(used === "used" ? "payment_in_another_transaction" : "payment_reverted");
+    }
+    if (found.state === "too_old") return refused("payment_too_old");
+    if (found.state !== "paid") return refused("payment_not_in_transaction");
+
+    try {
+      const claim = await payments.claim({ key, expiresAt: now() + DIRECT_MAX_AGE_SECONDS + 7200 }, owner, null, now(), { direct: { plan, from, transaction: found.transaction } });
+      if (!claim.rec) return failed(409, claim.existing.owner === owner ? "payment_in_progress" : "payment_already_used", "settled");
+      if (!(await payments.settling(key, claim.rec.id, null))) return failed(409, "payment_in_progress", "settled");
+      if (!(await payments.owed(key, claim.rec.id, await fieldsOf(claim.rec)))) return failed(409, "payment_in_progress", "settled");
+      return await deliverOwed();
+    } catch {
+      return failed(502, "store_unavailable", "settled", { "retry-after": "180" }); // paid and taken: the same header again finishes it, after the lease
+    }
+  }
+
   return async function gate(request, next) {
     let modeError = null;
 
@@ -410,6 +568,9 @@ export function createX402Gate(given) {
       if (r.ok) return serveAuthorised(request, next, r.rollback, {});
       modeError = r.error;
     }
+
+    const directHeader = direct ? request.headers.get(DIRECT_HEADER) : null;
+    if (directHeader) return directPayment(request, next, directHeader);
 
     let channelInfo;
     const voucher = config.prepaid ? request.headers.get(VOUCHER_HEADER) : null;
@@ -432,6 +593,7 @@ export function createX402Gate(given) {
       if (header) break;
     }
     if (!header) return quote(request, modeError ?? undefined, channelInfo);
+    if (!base) return quote(request, "pay_with_hub_direct", undefined, "refused"); // this gate asks no facilitator
     if (header.length > MAX_PAYMENT_HEADER) return quote(request, "payment_header_too_large");
 
     let payload;
